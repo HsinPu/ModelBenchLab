@@ -12,3 +12,6 @@ dist/
 *.log
 work/
 *.tsbuildinfo
+
+*.db.pre-v02-*.bak
+.ruff_cache/

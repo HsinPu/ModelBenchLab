@@ -2,8 +2,12 @@
 
 繁體中文 LLM 評估工作台：用同一份題庫比較多個模型的回答、品質與延遲。
 
-## v0.1 功能
-- OpenAI 相容模型 API、本機端點、加密 API Key、連線測試。
+## v0.2 功能
+- OpenRouter 廠商連線、加密 API Key、驗證與輪替、共用金鑰及啟停。
+- 模型目錄同步快取、搜尋 / 能力 / 免費篩選、分頁與批次加入。
+- 保留手動 OpenAI 相容 API 與本機模型端點，試跑前提示可能費用。
+- 結果記錄回傳模型、服務商、generation ID、token 與實際費用；缺漏資料顯示未知。
+- Alembic 升級既有資料庫，SQLite 升級前自動備份。
 - 兩個不需金鑰的 Demo 模型與 10 題範例，可直接走完流程。
 - 題庫 / Prompt 不可變版本；JSON、CSV 匯入與多輪對話。
 - 背景執行、即時進度、取消、失敗重跑、設定快照。
@@ -26,6 +30,13 @@ powershell -ExecutionPolicy Bypass -File scripts/start-local.ps1
 後端 API 文件：http://127.0.0.1:8000/docs 。
 停止：`powershell -ExecutionPolicy Bypass -File scripts/stop-local.ps1`。
 日誌位於 work/；資料庫與本機加密主金鑰位於 backend/modelbench.db、backend/.local-key，皆不進 Git。請一起備份，遺失金鑰後無法還原既有 API Key。
+
+## 連接 OpenRouter
+進入「模型管理 → 廠商連線」，新增連線並輸入自己的 API Key，然後點「驗證金鑰 → 瀏覽模型」。勾選模型後批次加入，即可建立測試。
+
+驗證只讀取金鑰資訊，不產生推論；「試跑模型」與正式測試可能計費。完整金鑰操作、費用與重試規則見 [OpenRouter 使用說明](docs/openrouter.md)。
+
+從 v0.1 升級時，先停止舊服務、安裝新的 requirements.lock，再重新啟動。Alembic 保留既有模型 ID 與測試結果；SQLite 自動備份仍須搭配 `.local-key` 保存。PostgreSQL 請先自行備份。
 
 ## 手動啟動 / macOS / Linux
 安裝相同依賴並啟用虛擬環境，在 backend/ 分別執行 `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000` 與 `python -m app.execution`；frontend/ 執行 `npm run dev`。
@@ -55,6 +66,6 @@ npm run build
 ```
 
 ## 邊界
-v0.1 尚無帳號權限、串流、LLM Judge、跨 Run 回歸比較、費用估算、MLCommons 整合、資料庫 migration。真實模型的 temperature/max_tokens 支援依供應商而定；目前使用非串流 chat/completions 文字回應。
+v0.2 尚無帳號權限、串流、工具執行、LLM Judge、跨 Run 回歸比較、預算控制與 MLCommons 整合。使用非串流 chat/completions 文字回應；OpenRouter 會檢查 temperature/max_tokens 支援，不支援時明確拒絕。目錄價格供參考，結果只採用上游回報費用。
 本專案獨立開發，未複製 MLCommons ModelBench 程式碼，亦無官方關聯。
 詳見 docs/architecture.md、docs/verification.md、AGENTS.md。

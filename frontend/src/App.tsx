@@ -20,6 +20,8 @@ import {
 } from "lucide-react";
 import { api, Model, Dataset, Prompt, Run, Detail, Case, Item } from "./api";
 
+import ModelManagement from "./features/models/ModelManagement";
+
 const labels: Record<string, string> = {
   queued: "等待執行",
   running: "執行中",
@@ -154,7 +156,9 @@ export default function App() {
       name: "模型比較 · " + new Date().toLocaleDateString("zh-TW"),
       dataset_id: datasets[0]?.id || "",
       prompt_id: prompts[0]?.id || "",
-      model_ids: models.filter((m) => m.provider === "demo").map((m) => m.id),
+      model_ids: models
+        .filter((m) => m.provider === "demo" && m.available !== false)
+        .map((m) => m.id),
       repeats: 1,
       temperature: 0,
       max_tokens: 512,
@@ -311,8 +315,31 @@ export default function App() {
                   ? "Token 未提供"
                   : result.output_tokens + " output tokens"}
               </span>
-              {result.demo && <span>示範資料</span>}
+              {result.demo ? (
+                <span>示範資料</span>
+              ) : (
+                <span>
+                  費用 {result.cost == null ? "未知" : "$" + result.cost}
+                </span>
+              )}
             </div>
+            {!result.demo && (
+              <details className="result-trace">
+                <summary>檢視模型與路由資訊</summary>
+                <dl>
+                  <dt>請求模型</dt>
+                  <dd>{result.requested_model || model.model}</dd>
+                  <dt>回傳模型</dt>
+                  <dd>{result.resolved_model || "上游未提供"}</dd>
+                  <dt>服務商</dt>
+                  <dd>{result.upstream_provider || "上游未提供"}</dd>
+                  <dt>Generation</dt>
+                  <dd>{result.generation_id || "上游未提供"}</dd>
+                  <dt>金鑰版本</dt>
+                  <dd>{result.credential_version ?? "未記錄"}</dd>
+                </dl>
+              </details>
+            )}
             <div className="reason">
               {review && ev?.passed === null
                 ? "已記錄人工評分；不納入自動通過率"
@@ -374,7 +401,7 @@ export default function App() {
           <div>
             我的實驗室<small>Local workspace</small>
           </div>
-          <span className="version">v0.1</span>
+          <span className="version">v0.2</span>
         </div>
         <div className="nav-label">工作台</div>
         <nav>
@@ -471,9 +498,9 @@ export default function App() {
               </button>
             )}
             {page === "models" && (
-              <button className="primary" onClick={() => setModal("model")}>
+              <button className="primary" onClick={newRun}>
                 <Plus size={18} />
-                新增模型
+                建立測試
               </button>
             )}
             {page === "datasets" && (
@@ -553,7 +580,12 @@ export default function App() {
                   </span>
                   <strong>{models.length.toString().padStart(2, "0")}</strong>
                   <small>
-                    包含 {models.filter((m) => m.provider === "demo").length}{" "}
+                    包含{" "}
+                    {
+                      models.filter(
+                        (m) => m.provider === "demo" && m.available !== false,
+                      ).length
+                    }{" "}
                     個示範模型
                   </small>
                 </div>
@@ -615,58 +647,11 @@ export default function App() {
             <section className="panel">{runTable(runs)}</section>
           )}
           {page === "models" && (
-            <>
-              <div className="card-grid">
-                {models.map((m) => (
-                  <article className="model-card" key={m.id}>
-                    <div className="card-top">
-                      <span className="tile-icon">
-                        <Layers3 size={22} />
-                      </span>
-                      <span className="pill neutral">
-                        {m.provider === "demo" ? "DEMO" : "API"}
-                      </span>
-                    </div>
-                    <h3>{m.name}</h3>
-                    <code>{m.model}</code>
-                    <p>
-                      {m.provider === "demo"
-                        ? "內建固定回答，無需金鑰，不產生 API 費用。"
-                        : m.endpoint}
-                    </p>
-                    <div className="card-footer">
-                      <small>
-                        {m.has_key
-                          ? "金鑰已加密保存"
-                          : m.provider === "demo"
-                            ? "本機示範"
-                            : "未設定金鑰"}
-                      </small>
-                      <button
-                        disabled={busy}
-                        className="text-button"
-                        onClick={() =>
-                          action(async () => {
-                            const r = await api<{ latency_ms: number }>(
-                              "/models/" + m.id + "/test",
-                              {},
-                            );
-                            setNotice("連線成功 · " + r.latency_ms + " ms");
-                          })
-                        }
-                      >
-                        測試連線 <ArrowRight size={14} />
-                      </button>
-                    </div>
-                  </article>
-                ))}
-              </div>
-              <div className="hint">
-                <Settings2 size={18} />
-                API 端點請填寫 base URL（例如
-                http://localhost:11434/v1）。連線測試會發出一筆短請求。
-              </div>
-            </>
+            <ModelManagement
+              models={models}
+              onRefresh={refresh}
+              onAddManual={() => setModal("model")}
+            />
           )}
           {page === "datasets" && (
             <div className="card-grid">
@@ -934,7 +919,7 @@ export default function App() {
           )}
           <footer>
             ModelBenchLab <span>可追溯的實驗 · 可比較的結果</span>
-            <span className="footer-right">MVP / 0.1.0</span>
+            <span className="footer-right">MVP / 0.2.0</span>
           </footer>
         </div>
       </main>
@@ -1041,6 +1026,7 @@ export default function App() {
                     <label key={m.id}>
                       <input
                         type="checkbox"
+                        disabled={m.available === false}
                         checked={runForm.model_ids.includes(m.id)}
                         onChange={(e) =>
                           setRunForm({
@@ -1054,7 +1040,11 @@ export default function App() {
                       <span>
                         {m.name}
                         <small>
-                          {m.provider === "demo" ? "示範模型 · 免費" : m.model}
+                          {m.available === false
+                            ? m.unavailable_reason
+                            : m.provider === "demo"
+                              ? "示範模型 · 免費"
+                              : m.model}
                         </small>
                       </span>
                     </label>
@@ -1130,7 +1120,10 @@ export default function App() {
                 <div className="estimate">
                   <span>預計執行工作</span>
                   <strong>{requests} 次</strong>
-                  <small>暫時性錯誤最多重試 2 次；真實模型依供應商計費。</small>
+                  <small>
+                    限流或服務暫時異常最多重試 2
+                    次；逾時不自動重送。真實模型依供應商計費。
+                  </small>
                 </div>
                 <button
                   className="primary full"
