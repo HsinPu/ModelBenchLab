@@ -1,0 +1,59 @@
+x-backend: &backend
+  build: ./backend
+  environment: &backend-env
+    DATABASE_URL: postgresql+psycopg://modelbench:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres/modelbench
+    REDIS_URL: redis://redis:6379/0
+    TASK_MODE: celery
+    APP_ENV: production
+    APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?Set APP_ENCRYPTION_KEY in .env}
+    SEED_DEMO: '1'
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+services:
+  frontend:
+    build: ./frontend
+    ports: ['127.0.0.1:8080:80']
+    depends_on:
+      api:
+        condition: service_healthy
+  api:
+    <<: *backend
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8000/api/health")']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  worker:
+    <<: *backend
+    command: celery -A app.tasks.celery worker --loglevel=info --concurrency=2
+    depends_on:
+      api:
+        condition: service_healthy
+  scheduler:
+    <<: *backend
+    command: celery -A app.tasks.celery beat --loglevel=info
+    depends_on:
+      api:
+        condition: service_healthy
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: modelbench
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: modelbench
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U modelbench']
+      interval: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      retries: 10
+volumes:
+  pgdata:

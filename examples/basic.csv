@@ -1,0 +1,3 @@
+title,question,kind,expected
+基礎算術,請只回答：2 + 2 等於多少？,exact,4
+地理知識,法國的首都是哪裡？,contains,巴黎
