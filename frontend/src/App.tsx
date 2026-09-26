@@ -16,11 +16,15 @@ import {
   Sparkles,
   Terminal,
   TextCursorInput,
+  Trash2,
   X,
 } from "lucide-react";
 import { api, Model, Dataset, Prompt, Run, Detail, Case, Item } from "./api";
 
 import ModelManagement from "./features/models/ModelManagement";
+import DatasetImport from "./features/datasets/DatasetImport";
+import { parseDatasetFile } from "./features/datasets/parseDatasetFile";
+import RankingChart from "./features/RankingChart";
 
 const labels: Record<string, string> = {
   queued: "等待執行",
@@ -68,14 +72,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [online, setOnline] = useState(false);
   const [filter, setFilter] = useState("all");
-  const [modelForm, setModelForm] = useState({
-    name: "",
-    provider: "openai-compatible",
-    model: "",
-    endpoint: "http://localhost:11434/v1",
-    api_key: "",
-  });
   const [datasetName, setDatasetName] = useState("");
+  const [deletingDataset, setDeletingDataset] = useState<Dataset | null>(null);
+  const [deletingRun, setDeletingRun] = useState<Run | null>(null);
   const [cases, setCases] = useState<Case[]>([{ ...initialCase }]);
   const [jsonMode, setJsonMode] = useState(false);
   const [caseJson, setCaseJson] = useState("");
@@ -87,9 +86,11 @@ export default function App() {
     model_ids: [] as string[],
     repeats: 1,
     temperature: 0,
-    max_tokens: 512,
-    timeout: 60,
+    max_tokens: null as number | null,
+    timeout: 600,
   });
+  const [batchConfirmed, setBatchConfirmed] = useState(false);
+  useEffect(() => setBatchConfirmed(false), [runForm.dataset_id, runForm.model_ids, runForm.repeats, runForm.max_tokens]);
   const [reviewItem, setReviewItem] = useState<Item | null>(null);
   const [reviewScore, setReviewScore] = useState(4);
   const [reviewNote, setReviewNote] = useState("");
@@ -119,7 +120,8 @@ export default function App() {
   }, [notice]);
   useEffect(() => {
     if (!runs.some((r) => active(r.status))) return;
-    const t = setInterval(() => refresh().catch(() => {}), 2500);
+    const interval = runs.some((r) => r.batch_id && active(r.status)) ? 10000 : 2500;
+    const t = setInterval(() => refresh().catch(() => {}), interval);
     return () => clearInterval(t);
   }, [runs]);
   useEffect(() => {
@@ -151,18 +153,19 @@ export default function App() {
       setFilter("all");
     });
   }
-  function newRun() {
+  function newRun(datasetChoice?: string) {
+    setBatchConfirmed(false);
     setRunForm({
       name: "模型比較 · " + new Date().toLocaleDateString("zh-TW"),
-      dataset_id: datasets[0]?.id || "",
+      dataset_id: datasetChoice || (datasets[0]?.bundle_id ? `bundle:${datasets[0].bundle_id}` : datasets[0]?.id) || "",
       prompt_id: prompts[0]?.id || "",
       model_ids: models
         .filter((m) => m.provider === "demo" && m.available !== false)
         .map((m) => m.id),
       repeats: 1,
       temperature: 0,
-      max_tokens: 512,
-      timeout: 60,
+      max_tokens: null,
+      timeout: 600,
     });
     setModal("run");
   }
@@ -182,11 +185,33 @@ export default function App() {
     setJsonMode(false);
     setModal("dataset");
   }
-  const selectedDataset = datasets.find((d) => d.id === runForm.dataset_id);
+  const selectedBundleId = runForm.dataset_id.startsWith("bundle:") ? runForm.dataset_id.slice(7) : null;
+  const selectedDatasets = selectedBundleId
+    ? datasets.filter((d) => d.bundle_id === selectedBundleId)
+    : datasets.filter((d) => d.id === runForm.dataset_id);
   const requests =
-    (selectedDataset?.cases.length || 0) *
+    selectedDatasets.reduce((sum, d) => sum + (d.case_count ?? d.cases.length), 0) *
     runForm.model_ids.length *
     runForm.repeats;
+  const selectedModels = models.filter((model) => runForm.model_ids.includes(model.id));
+  const noTemperatureModels = selectedModels.filter(
+    (model) => model.provider === "openrouter" && model.catalog &&
+      !model.catalog.supported_parameters.includes("temperature"),
+  );
+  const noTokenLimitModels = selectedModels.filter(
+    (model) => model.provider === "openrouter" && model.catalog &&
+      !model.catalog.supported_parameters.includes("max_tokens"),
+  );
+  const overCatalogLimit = selectedModels.filter(
+    (model) => model.catalog?.supported_parameters.includes("max_tokens") &&
+      model.catalog.max_completion_tokens != null &&
+      (runForm.max_tokens ?? model.max_output_tokens) > model.catalog.max_completion_tokens,
+  );
+  const datasetChoices = datasets.filter((d) => !d.bundle_id || d.bundle_index === 1);
+  const deletingRunActive = deletingRun !== null && (
+    active(deletingRun.status) ||
+    (!!deletingRun.batch_id && runs.some((r) => r.batch_id === deletingRun.batch_id && active(r.status)))
+  );
   const titles: Record<string, string> = {
     overview: "評估總覽",
     runs: "測試紀錄",
@@ -240,7 +265,25 @@ export default function App() {
                 </td>
                 <td className="muted">{formatTime(r.created_at)}</td>
                 <td>
-                  <ChevronRight size={16} />
+                  <div className="run-row-actions">
+                    {page === "runs" && (
+                      <button
+                        type="button"
+                        className="text-button run-delete-button"
+                        aria-label={`刪除測試紀錄 ${r.name}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDeletingRun(r);
+                          setError("");
+                          setModal("delete-run");
+                        }}
+                        onKeyDown={(e) => e.stopPropagation()}
+                      >
+                        <Trash2 size={15} /> 刪除
+                      </button>
+                    )}
+                    <ChevronRight size={16} />
+                  </div>
                 </td>
               </tr>
             ))}
@@ -252,7 +295,7 @@ export default function App() {
         <FlaskConical size={34} />
         <h3>你的第一場模型實驗，從這裡開始</h3>
         <p>已準備好 10 題示範題庫與兩個示範模型，不需要 API Key。</p>
-        <button className="primary" onClick={newRun}>
+        <button className="primary" onClick={() => newRun()}>
           <Play size={16} />
           建立第一個測試
         </button>
@@ -268,6 +311,8 @@ export default function App() {
         </div>
       );
     const result = item.result;
+    const lastAttempt = item.attempts.at(-1);
+    const diagnostics = lastAttempt?.diagnostics;
     const ev = result?.evaluation;
     const review = detail?.reviews.filter((r) => r.item_id === item.id).at(-1);
     return (
@@ -299,13 +344,32 @@ export default function App() {
         </div>
         <pre>
           {result?.output ||
-            item.attempts.at(-1)?.error ||
+            lastAttempt?.error ||
             (item.status === "queued"
               ? "等待 Worker 執行…"
               : item.status === "running"
                 ? "正在生成回答…"
                 : "尚無回答")}
         </pre>
+        {!result && lastAttempt?.code === "no_text_output" && (
+          <p className="reason">上游已有回應；這不是本工具判定的網路逾時。單靠空白回答與長度限制，無法確定推理 Token 是否用完。</p>
+        )}
+        {!result && diagnostics && Object.keys(diagnostics).length > 0 && (
+          <details className="result-trace">
+            <summary>檢視錯誤診斷</summary>
+            <dl>
+              {diagnostics.resolved_model && <><dt>實際模型</dt><dd>{diagnostics.resolved_model}</dd></>}
+              {diagnostics.finish_reason && <><dt>結束原因</dt><dd>{diagnostics.finish_reason}</dd></>}
+              {diagnostics.http_status != null && <><dt>HTTP 狀態</dt><dd>{diagnostics.http_status}</dd></>}
+              {diagnostics.requested_max_tokens != null && <><dt>請求輸出上限</dt><dd>{diagnostics.requested_max_tokens.toLocaleString()} tokens</dd></>}
+              {diagnostics.completion_tokens != null && <><dt>回報輸出用量</dt><dd>{diagnostics.completion_tokens.toLocaleString()} tokens</dd></>}
+              {diagnostics.reasoning_tokens != null && <><dt>其中推理用量</dt><dd>{diagnostics.reasoning_tokens.toLocaleString()} tokens</dd></>}
+              {diagnostics.timeout_kind && <><dt>逾時階段</dt><dd>{diagnostics.timeout_kind}</dd></>}
+              {diagnostics.configured_timeout_seconds != null && <><dt>網路等待設定</dt><dd>{diagnostics.configured_timeout_seconds} 秒</dd></>}
+              {diagnostics.elapsed_ms != null && <><dt>整體耗時</dt><dd>{(diagnostics.elapsed_ms / 1000).toFixed(1)} 秒</dd></>}
+            </dl>
+          </details>
+        )}
         {result && (
           <>
             <div className="answer-meta">
@@ -492,22 +556,23 @@ export default function App() {
               </p>
             </div>
             {["overview", "runs"].includes(page) && (
-              <button className="primary" onClick={newRun} disabled={!online}>
+              <button className="primary" onClick={() => newRun()} disabled={!online}>
                 <Plus size={18} />
                 建立測試
               </button>
             )}
-            {page === "models" && (
-              <button className="primary" onClick={newRun}>
-                <Plus size={18} />
-                建立測試
-              </button>
-            )}
+
             {page === "datasets" && (
-              <button className="primary" onClick={() => newDataset()}>
-                <Plus size={18} />
-                建立題庫
-              </button>
+              <div className="heading-actions">
+                <button className="secondary" onClick={() => { setError(""); setModal("import"); }}>
+                  <Database size={17} />
+                  匯入
+                </button>
+                <button className="primary" onClick={() => newDataset()}>
+                  <Plus size={18} />
+                  建立題庫
+                </button>
+              </div>
             )}
             {page === "prompts" && (
               <button
@@ -539,7 +604,7 @@ export default function App() {
                     <br />
                     在同一個工作台完成測試、評分與比較。
                   </p>
-                  <button onClick={newRun} disabled={!online}>
+                  <button onClick={() => newRun()} disabled={!online}>
                     開始模型比較 <ArrowRight size={17} />
                   </button>
                 </div>
@@ -596,7 +661,7 @@ export default function App() {
                   </span>
                   <strong>{datasets.length.toString().padStart(2, "0")}</strong>
                   <small>
-                    共 {datasets.reduce((s, d) => s + d.cases.length, 0)}{" "}
+                    共 {datasets.reduce((s, d) => s + (d.case_count ?? d.cases.length), 0)}{" "}
                     道測試題目
                   </small>
                 </div>
@@ -621,64 +686,61 @@ export default function App() {
                   <small>僅計入有自動評分的回答</small>
                 </div>
               </div>
-              <section className="panel">
-                <div className="section-head">
-                  <h2>
-                    最近的測試 <span>RECENT RUNS</span>
-                  </h2>
-                  <button
-                    className="text-button"
-                    onClick={() => setPage("runs")}
-                  >
-                    查看全部 <ArrowRight size={15} />
-                  </button>
-                </div>
-                {runTable(runs.slice(0, 5))}
-              </section>
-              <div className="hint">
-                <FlaskConical size={18} />
-                <span>
-                  示範模式提供固定回答與模擬延遲，僅用於熟悉流程，不代表真實模型能力。
-                </span>
-              </div>
+              <RankingChart
+                runs={runs}
+                onOpenRun={openRun}
+                onNewRun={() => newRun()}
+              />
             </>
           )}
           {page === "runs" && (
             <section className="panel">{runTable(runs)}</section>
           )}
           {page === "models" && (
-            <ModelManagement
-              models={models}
-              onRefresh={refresh}
-              onAddManual={() => setModal("model")}
-            />
+            <ModelManagement models={models} onRefresh={refresh} />
           )}
           {page === "datasets" && (
             <div className="card-grid">
-              {datasets.map((d) => (
+              {datasetChoices.length === 0 && (
+                <div className="empty">目前沒有可用題庫。可建立新題庫，或從 Hugging Face／本機檔案匯入。</div>
+              )}
+              {datasetChoices.map((d) => (
                 <article className="model-card" key={d.id}>
                   <div className="card-top">
                     <span className="tile-icon">
                       <Database size={22} />
                     </span>
-                    <span className="pill neutral">{d.cases.length} 題</span>
+                    <span className="pill neutral">{d.bundle_id
+                      ? datasets.filter((part) => part.bundle_id === d.bundle_id).reduce((sum, part) => sum + (part.case_count ?? part.cases.length), 0)
+                      : d.case_count ?? d.cases.length} 題</span>
                   </div>
-                  <h3>{d.name}</h3>
+                  <h3>{d.bundle_name || d.name}</h3>
                   <p>
-                    {d.cases
-                      .slice(0, 3)
-                      .map((c) => c.title)
-                      .join(" · ")}
-                    {d.cases.length > 3 ? "…" : ""}
+                    {d.bundle_id
+                      ? `全科題庫 · ${d.bundle_total} 批 · 建立測試時一次送出`
+                      : <>{d.cases.slice(0, 3).map((c) => c.title).join(" · ")}{d.cases.length > 3 ? "…" : ""}</>}
                   </p>
                   <div className="card-footer">
                     <small>不可變更的題庫版本</small>
-                    <button
-                      className="text-button"
-                      onClick={() => newDataset(d)}
-                    >
-                      檢視 / 複製編輯 <ArrowRight size={14} />
-                    </button>
+                    <div className="dataset-card-actions">
+                      <button
+                        className="text-button"
+                        onClick={() => d.bundle_id ? newRun(`bundle:${d.bundle_id}`) : newDataset(d)}
+                      >
+                        {d.bundle_id ? "建立整批測試" : "檢視 / 複製編輯"} <ArrowRight size={14} />
+                      </button>
+                      <button
+                        className="text-button dataset-delete-button"
+                        aria-label={`刪除題庫 ${d.bundle_name || d.name}`}
+                        onClick={() => {
+                          setDeletingDataset(d);
+                          setError("");
+                          setModal("delete-dataset");
+                        }}
+                      >
+                        <Trash2 size={14} /> 刪除
+                      </button>
+                    </div>
                   </div>
                 </article>
               ))}
@@ -783,6 +845,17 @@ export default function App() {
                 >
                   CSV
                 </a>
+                <button
+                  type="button"
+                  className="secondary run-delete-button"
+                  onClick={() => {
+                    setDeletingRun(detail);
+                    setError("");
+                    setModal("delete-run");
+                  }}
+                >
+                  <Trash2 size={15} /> 刪除
+                </button>
               </div>
               <div className="progress">
                 <div
@@ -934,7 +1007,7 @@ export default function App() {
             role="dialog"
             aria-modal="true"
             aria-labelledby="modal-title"
-            className={"modal " + (modal === "dataset" ? "wide" : "")}
+            className={"modal " + (["dataset", "import"].includes(modal) ? "wide" : "")}
           >
             <div className="modal-title">
               <div>
@@ -944,8 +1017,10 @@ export default function App() {
                     (
                       {
                         run: "建立模型測試",
-                        model: "連接新模型",
                         dataset: "建立題庫版本",
+                        "delete-dataset": "刪除測試題庫",
+                        "delete-run": "刪除測試紀錄",
+                        import: "匯入題庫",
                         prompt: "建立 Prompt 版本",
                         review: "人工評分",
                       } as Record<string, string>
@@ -962,11 +1037,85 @@ export default function App() {
               </button>
             </div>
             {error && <div className="alert error">{error}</div>}
+            {modal === "delete-run" && deletingRun && (
+              <div className="run-delete-confirm">
+                <p>確定要刪除「{deletingRun.name}」嗎？</p>
+                <p>
+                  {deletingRun.batch_id && "同一批次的所有測試紀錄會一併移除。"}
+                  刪除後無法在介面檢視或匯出這些結果；資料仍保留於本機資料庫。
+                </p>
+                {deletingRunActive && <p>測試尚未停止。請先取消測試，等待所有工作停止後再刪除。</p>}
+                <div className="dataset-delete-actions">
+                  <button type="button" className="secondary" disabled={busy} onClick={() => setModal(null)}>取消</button>
+                  <button type="button" className="primary dataset-danger-fill" disabled={busy || deletingRunActive} onClick={() => action(async () => {
+                    await api(`/runs/${deletingRun.id}`, undefined, "DELETE");
+                    setModal(null);
+                    setDeletingRun(null);
+                    setDetail(null);
+                    setPage("runs");
+                    await refresh();
+                    setNotice("測試紀錄已移除");
+                  })}>
+                    {busy ? "刪除中…" : "確認刪除"}
+                  </button>
+                </div>
+              </div>
+            )}
+            {modal === "delete-dataset" && deletingDataset && (
+              <div className="dataset-delete-confirm">
+                <p>確定要刪除「{deletingDataset.bundle_name || deletingDataset.name}」嗎？</p>
+                <p>
+                  {deletingDataset.bundle_id
+                    ? `這組題庫的 ${deletingDataset.bundle_total} 個批次會一併從可用清單移除。`
+                    : "此題庫會從可用清單移除。"}
+                  之後無法用它建立新測試；既有測試紀錄與結果仍會保留。
+                </p>
+                <div className="dataset-delete-actions">
+                  <button type="button" className="secondary" disabled={busy} onClick={() => setModal(null)}>取消</button>
+                  <button type="button" className="primary dataset-danger-fill" disabled={busy} onClick={() => action(async () => {
+                    await api(`/datasets/${deletingDataset.id}`, undefined, "DELETE");
+                    setModal(null);
+                    setDeletingDataset(null);
+                    await refresh();
+                    setNotice("題庫已從可用清單移除");
+                  })}>
+                    {busy ? "刪除中…" : "確認刪除"}
+                  </button>
+                </div>
+              </div>
+            )}
+            {modal === "import" && (
+              <DatasetImport
+                onSaved={() => {
+                  setModal(null);
+                  setNotice("題庫已加入，可用於建立測試");
+                  refresh().catch((e) => setError(e instanceof Error ? e.message : "無法更新題庫清單"));
+                }}
+                onLocalFile={(file, importedCases) => {
+                  setDatasetName(file.name.replace(/\.(json|csv)$/i, ""));
+                  setCases(importedCases);
+                  setCaseJson(JSON.stringify(importedCases, null, 2));
+                  setJsonMode(true);
+                  setError("");
+                  setModal("dataset");
+                }}
+              />
+            )}
             {modal === "run" && (
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
                   action(async () => {
+                    if (selectedBundleId) {
+                      const result = await api<{ runs: number; jobs: number }>("/run-batches", {
+                        ...runForm, dataset_id: undefined, bundle_id: selectedBundleId,
+                      });
+                      await refresh();
+                      setPage("runs");
+                      setModal(null);
+                      setNotice(`已建立 ${result.runs} 批測試，共 ${result.jobs} 個工作項目`);
+                      return;
+                    }
                     const r = await api<Run>("/runs", runForm);
                     await refresh();
                     setDetail(await api("/runs/" + r.id));
@@ -992,13 +1141,16 @@ export default function App() {
                     <select
                       required
                       value={runForm.dataset_id}
-                      onChange={(e) =>
-                        setRunForm({ ...runForm, dataset_id: e.target.value })
-                      }
+                      onChange={(e) => {
+                        setRunForm({ ...runForm, dataset_id: e.target.value });
+                        setBatchConfirmed(false);
+                      }}
                     >
-                      {datasets.map((d) => (
-                        <option key={d.id} value={d.id}>
-                          {d.name}（{d.cases.length} 題）
+                      {datasetChoices.map((d) => (
+                        <option key={d.id} value={d.bundle_id ? `bundle:${d.bundle_id}` : d.id}>
+                          {d.bundle_name || d.name}（{d.bundle_id
+                            ? datasets.filter((part) => part.bundle_id === d.bundle_id).reduce((sum, part) => sum + (part.case_count ?? part.cases.length), 0)
+                            : d.case_count ?? d.cases.length} 題）
                         </option>
                       ))}
                     </select>
@@ -1083,29 +1235,43 @@ export default function App() {
                         })
                       }
                     />
+                    {noTemperatureModels.length > 0 && (
+                      <small>這些模型未宣告支援 Temperature，請求會略過此設定：{noTemperatureModels.map((model) => model.name).join("、")}</small>
+                    )}
                   </label>
                   <label>
-                    輸出 Token 上限
+                    覆寫輸出 Token 上限（選填）
                     <input
                       type="number"
                       min="1"
-                      max="8192"
-                      required
-                      value={runForm.max_tokens}
+                      max="131072"
+                      step="1"
+                      placeholder="留空時依各模型設定"
+                      value={runForm.max_tokens ?? ""}
                       onChange={(e) =>
                         setRunForm({
                           ...runForm,
-                          max_tokens: Number(e.target.value),
+                          max_tokens: e.target.value === "" ? null : Number(e.target.value),
                         })
                       }
                     />
+                    <small>留空時使用各模型的輸出上限（新模型預設 32,768）；填寫後套用至本次所有模型。上限含可能的推理 token，實際費用依用量計。</small>
+                    {noTokenLimitModels.length > 0 && (
+                      <small>這些模型未宣告支援 max_tokens，請求會略過此上限：{noTokenLimitModels.map((model) => model.name).join("、")}</small>
+                    )}
+                    {selectedModels.length > 0 && runForm.max_tokens === null && (
+                      <small>目前模型設定：{selectedModels.map((model) => `${model.name} ${model.max_output_tokens.toLocaleString()}`).join("、")}</small>
+                    )}
+                    {overCatalogLimit.length > 0 && (
+                      <small role="alert">超過目錄宣告上限：{overCatalogLimit.map((model) => `${model.name} ${model.catalog?.max_completion_tokens?.toLocaleString()}`).join("、")}；請調低模型設定或填入較低的本次覆寫值。</small>
+                    )}
                   </label>
                   <label>
-                    單次逾時（秒）
+                    網路等待逾時（秒）
                     <input
                       type="number"
                       min="5"
-                      max="180"
+                      max="600"
                       required
                       value={runForm.timeout}
                       onChange={(e) =>
@@ -1115,6 +1281,7 @@ export default function App() {
                         })
                       }
                     />
+                    <small>這是單次連線或讀寫等待的上限，不是整題總耗時上限；總耗時可能超過此值。</small>
                   </label>
                 </div>
                 <div className="estimate">
@@ -1124,84 +1291,23 @@ export default function App() {
                     限流或服務暫時異常最多重試 2
                     次；逾時不自動重送。真實模型依供應商計費。
                   </small>
+                  {selectedBundleId && <small>
+                    系統會將題目分批成每次最多 5,000 個工作項目；整批上限 50,000 次。
+                  </small>}
+                  {requests > (selectedBundleId ? 50000 : 5000) && <small role="alert">
+                    超過測試上限，請減少模型或重複次數。
+                  </small>}
                 </div>
+                {selectedBundleId && <label className="batch-confirm">
+                  <input type="checkbox" checked={batchConfirmed} onChange={(e) => setBatchConfirmed(e.target.checked)} />
+                  我已確認 {requests} 次模型請求可能產生費用，並要一次送出全部批次。
+                </label>}
                 <button
                   className="primary full"
-                  disabled={busy || !requests || requests > 5000}
+                  disabled={busy || !requests || requests > (selectedBundleId ? 50000 : 5000) || (selectedBundleId !== null && !batchConfirmed)}
                 >
                   <Play size={16} />
                   {busy ? "正在建立…" : "開始測試"}
-                </button>
-              </form>
-            )}
-            {modal === "model" && (
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  action(async () => {
-                    await api("/models", modelForm);
-                    await refresh();
-                    setModal(null);
-                    setModelForm({
-                      ...modelForm,
-                      name: "",
-                      model: "",
-                      api_key: "",
-                    });
-                    setNotice("模型已新增，金鑰已加密保存");
-                  });
-                }}
-              >
-                <label>
-                  顯示名稱
-                  <input
-                    required
-                    placeholder="例如：Local / Qwen"
-                    value={modelForm.name}
-                    onChange={(e) =>
-                      setModelForm({ ...modelForm, name: e.target.value })
-                    }
-                  />
-                </label>
-                <label>
-                  API Base URL
-                  <input
-                    required
-                    type="url"
-                    value={modelForm.endpoint}
-                    onChange={(e) =>
-                      setModelForm({ ...modelForm, endpoint: e.target.value })
-                    }
-                  />
-                </label>
-                <label>
-                  模型 ID
-                  <input
-                    required
-                    placeholder="供應商的模型名稱"
-                    value={modelForm.model}
-                    onChange={(e) =>
-                      setModelForm({ ...modelForm, model: e.target.value })
-                    }
-                  />
-                </label>
-                <label>
-                  API Key <span className="muted">（本機服務可留空）</span>
-                  <input
-                    type="password"
-                    autoComplete="new-password"
-                    value={modelForm.api_key}
-                    onChange={(e) =>
-                      setModelForm({ ...modelForm, api_key: e.target.value })
-                    }
-                  />
-                </label>
-                <p className="form-note">
-                  支援 OpenAI 相容的 chat/completions 文字介面。API Key
-                  僅由後端保存及使用。
-                </p>
-                <button className="primary full" disabled={busy}>
-                  儲存模型
                 </button>
               </form>
             )}
@@ -1316,38 +1422,13 @@ export default function App() {
                         const f = e.target.files?.[0];
                         if (!f) return;
                         action(async () => {
-                          const text = await f.text();
-                          let parsed: unknown;
-                          if (f.name.endsWith(".csv")) {
-                            const rows = parseCSV(text.replace(/^\uFEFF/, ""));
-                            const headers = rows.shift() || [];
-                            parsed = rows
-                              .filter((r) => r.some(Boolean))
-                              .map((r) => {
-                                const row = Object.fromEntries(
-                                  headers.map((h, i) => [h.trim(), r[i] || ""]),
-                                );
-                                return {
-                                  title: row.title,
-                                  messages: [
-                                    { role: "user", content: row.question },
-                                  ],
-                                  rule: {
-                                    kind: row.kind || "contains",
-                                    expected: row.expected || "",
-                                  },
-                                };
-                              });
-                          } else {
-                            const data = JSON.parse(text);
-                            parsed = Array.isArray(data) ? data : data.cases;
-                          }
-                          if (!Array.isArray(parsed))
-                            throw Error("檔案必須包含題目陣列");
+                          const parsed = await parseDatasetFile(f);
                           setCaseJson(JSON.stringify(parsed, null, 2));
+                          setCases(parsed);
                           setJsonMode(true);
                           setNotice("匯入完成，請檢查內容後儲存");
                         });
+                        e.target.value = "";
                       }}
                     />
                   </label>
@@ -1441,11 +1522,12 @@ export default function App() {
                             >
                               <option value="contains">包含文字</option>
                               <option value="exact">完全比對</option>
+                              <option value="choice">選擇題答案</option>
                               <option value="manual">人工評分</option>
                               <option value="json_schema">JSON Schema</option>
                             </select>
                           </label>
-                          {["contains", "exact"].includes(c.rule.kind) && (
+                          {["contains", "exact", "choice"].includes(c.rule.kind) && (
                             <label>
                               預期答案
                               <input
@@ -1555,35 +1637,4 @@ export default function App() {
       )}
     </div>
   );
-}
-
-function parseCSV(text: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = "";
-  let quoted = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === '"') {
-      if (quoted && text[i + 1] === '"') {
-        cell += '"';
-        i++;
-      } else quoted = !quoted;
-    } else if (ch === "," && !quoted) {
-      row.push(cell);
-      cell = "";
-    } else if ((ch === "\n" || ch === "\r") && !quoted) {
-      if (ch === "\r" && text[i + 1] === "\n") i++;
-      row.push(cell);
-      rows.push(row);
-      row = [];
-      cell = "";
-    } else cell += ch;
-  }
-  if (quoted) throw Error("CSV 引號未閉合");
-  if (cell || row.length) {
-    row.push(cell);
-    rows.push(row);
-  }
-  return rows;
 }

@@ -11,12 +11,14 @@ DEFAULT_ROUTING = {"allow_fallbacks": False, "require_parameters": True}
 
 class ProviderError(Exception):
     def __init__(
-        self, message, retryable=False, code="provider_error", retry_after=None
+        self, message, retryable=False, code="provider_error", retry_after=None,
+        diagnostics=None,
     ):
         super().__init__(message)
         self.retryable = retryable
         self.code = code
         self.retry_after = retry_after
+        self.diagnostics = diagnostics or {}
 
 
 def retry_delay(value):

@@ -3,12 +3,22 @@ from pydantic import BaseModel, Field, model_validator
 from urllib.parse import urlsplit
 from jsonschema.validators import validator_for
 
+ReasoningEffort = Literal['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+DEFAULT_NETWORK_TIMEOUT = 600
+MAX_NETWORK_TIMEOUT = 600
+
+
+class TrialInput(BaseModel):
+    timeout: int = Field(default=DEFAULT_NETWORK_TIMEOUT, ge=5, le=MAX_NETWORK_TIMEOUT)
+
 class ModelInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     provider: Literal['openai-compatible', 'demo'] = 'openai-compatible'
     endpoint: str = Field(default='', max_length=2000)
     model: str = Field(min_length=1, max_length=200)
     api_key: str = Field(default='', max_length=4000)
+    reasoning_effort: ReasoningEffort | None = None
+    max_output_tokens: int = Field(default=32768, ge=1, le=131072)
     @model_validator(mode='after')
     def endpoint_valid(self):
         if self.provider == 'openai-compatible':
@@ -22,13 +32,15 @@ class Message(BaseModel):
     content: str = Field(min_length=1, max_length=20000)
 
 class Rule(BaseModel):
-    kind: Literal['manual', 'exact', 'contains', 'json_schema'] = 'manual'
+    kind: Literal['manual', 'exact', 'contains', 'choice', 'json_schema'] = 'manual'
     expected: str = Field(default='', max_length=20000)
     schema_: dict = Field(default_factory=dict, alias='schema')
     @model_validator(mode='after')
     def valid_rule(self):
-        if self.kind in ('exact', 'contains') and not self.expected.strip():
+        if self.kind in ('exact', 'contains', 'choice') and not self.expected.strip():
             raise ValueError('比對規則必須提供 expected')
+        if self.kind == 'choice' and self.expected.strip().upper() not in ('A', 'B', 'C', 'D'):
+            raise ValueError('選擇題答案必須是 A、B、C 或 D')
         if self.kind == 'json_schema':
             # Remote references would cause uncontrolled network fetches.
             def walk(v):
@@ -51,10 +63,15 @@ class Case(BaseModel):
     messages: list[Message] = Field(min_length=1, max_length=30)
     rule: Rule = Field(default_factory=Rule)
     tags: list[str] = Field(default_factory=list, max_length=20)
+    source: dict | None = None
 
 class DatasetInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     cases: list[Case] = Field(min_length=1, max_length=1000)
+
+class DatasetBundleInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    cases: list[Case] = Field(min_length=1001, max_length=30000)
 
 class PromptInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
@@ -67,13 +84,17 @@ class RunInput(BaseModel):
     prompt_id: str
     repeats: int = Field(default=1, ge=1, le=5)
     temperature: float = Field(default=0, ge=0, le=2)
-    max_tokens: int = Field(default=512, ge=1, le=8192)
-    timeout: int = Field(default=60, ge=5, le=180)
+    max_tokens: int | None = Field(default=None, ge=1, le=131072)
+    timeout: int = Field(default=DEFAULT_NETWORK_TIMEOUT, ge=5, le=MAX_NETWORK_TIMEOUT)
     @model_validator(mode='after')
     def unique_models(self):
         if len(set(self.model_ids)) != len(self.model_ids):
             raise ValueError('模型不可重複')
         return self
+
+class RunBatchInput(RunInput):
+    dataset_id: str | None = None
+    bundle_id: str
 
 class ReviewInput(BaseModel):
     score: int = Field(ge=1, le=5)

@@ -42,28 +42,43 @@ def generate(config, messages, settings, key="", client=None):
     client = client or httpx.Client(timeout=settings["timeout"], follow_redirects=False)
     try:
         routed = config["provider"] == "openrouter"
-        payload = {
-            "model": config["model"],
-            "messages": messages,
-            "temperature": settings["temperature"],
-            "max_tokens": settings["max_tokens"],
-            "stream": False,
-        }
+        catalog = config.get("catalog") if routed else None
+        supported = (
+            catalog.get("supported_parameters") if isinstance(catalog, dict) else None
+        )
+        payload = {"model": config["model"], "messages": messages, "stream": False}
+        if supported is None or "temperature" in supported:
+            payload["temperature"] = settings["temperature"]
+        if supported is None or "max_tokens" in supported:
+            payload["max_tokens"] = settings["max_tokens"]
         headers = {"Authorization": "Bearer " + key} if key else {}
         if routed:
-            # Fixed model and explicit provider policy are part of the run snapshot.
-            payload["provider"] = {**(config.get("routing") or {}), **DEFAULT_ROUTING}
+            # Dynamic IDs select a model upstream; a fixed-provider policy would
+            # interfere with that selection. The requested ID stays in the snapshot.
+            if not isinstance(catalog, dict) or catalog.get("fixed_model", True):
+                payload["provider"] = {**(config.get("routing") or {}), **DEFAULT_ROUTING}
             headers["X-OpenRouter-Title"] = "ModelBenchLab"
+        effort = config.get("reasoning_effort")
+        if effort:
+            if routed:
+                payload["reasoning"] = {"effort": effort}
+            else:
+                payload["reasoning_effort"] = effort
         endpoint = BASE_URL if routed else config["endpoint"].rstrip("/")
         response = client.post(
             endpoint + "/chat/completions", headers=headers, json=payload
         )
-        check_response(response)
+        try:
+            check_response(response)
+        except ProviderError as error:
+            if effort and error.code == "invalid_request":
+                raise ProviderError(
+                    f"模型服務拒絕請求；可能不支援思考程度 {effort}，也請檢查其他參數",
+                    code="invalid_request",
+                ) from None
+            raise
         data = response.json()
         choice = data["choices"][0]
-        output = choice["message"]["content"]
-        if not isinstance(output, str):
-            raise ValueError("Non-text content")
         usage = data.get("usage") or {}
         if not isinstance(usage, dict):
             raise ValueError("Invalid usage")
@@ -80,6 +95,45 @@ def generate(config, messages, settings, key="", client=None):
             value = data.get(field)
             return value[:300] if isinstance(value, str) else None
 
+        output = choice["message"].get("content")
+        if output is None or (isinstance(output, str) and not output.strip()):
+            token_details = (
+                usage.get("completion_tokens_details")
+                or usage.get("output_tokens_details")
+                or {}
+            )
+            if not isinstance(token_details, dict):
+                token_details = {}
+            reasoning_tokens = token_details.get("reasoning_tokens")
+            diagnostics = {
+                "finish_reason": str(choice.get("finish_reason") or "unknown")[:40],
+                "http_status": response.status_code,
+                "requested_max_tokens": payload.get("max_tokens"),
+                "completion_tokens": token("completion_tokens"),
+                "reasoning_tokens": reasoning_tokens
+                if isinstance(reasoning_tokens, int)
+                and not isinstance(reasoning_tokens, bool)
+                and reasoning_tokens >= 0
+                else None,
+                "resolved_model": identifier("model"),
+                "elapsed_ms": round((time.perf_counter() - start) * 1000),
+            }
+            if choice.get("finish_reason") == "length":
+                raise ProviderError(
+                    "上游回傳空白文字，並表示輸出達到長度限制；請查看實際模型與 Token 診斷資訊",
+                    code="no_text_output",
+                    diagnostics=diagnostics,
+                )
+            raise ProviderError(
+                "上游回傳空白文字；請查看模型與回應診斷資訊",
+                code="no_text_output",
+                diagnostics=diagnostics,
+            )
+        if not isinstance(output, str):
+            raise ProviderError(
+                "模型回傳非文字內容，目前只支援 chat/completions 文字回答",
+                code="non_text_output",
+            )
         return {
             "output": output,
             "latency_ms": round((time.perf_counter() - start) * 1000),
@@ -98,10 +152,15 @@ def generate(config, messages, settings, key="", client=None):
             else None,
             "routing": payload.get("provider"),
         }
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as error:
         raise ProviderError(
-            "模型請求逾時；上游可能已執行並計費，請手動確認後重跑",
+            "模型連線或網路讀寫等待逾時；上游可能已執行並計費，請手動確認後重跑",
             code="timeout_uncertain",
+            diagnostics={
+                "timeout_kind": type(error).__name__,
+                "configured_timeout_seconds": settings["timeout"],
+                "elapsed_ms": round((time.perf_counter() - start) * 1000),
+            },
         )
     except httpx.RequestError:
         raise ProviderError(

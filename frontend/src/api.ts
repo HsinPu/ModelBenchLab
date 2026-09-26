@@ -10,8 +10,11 @@ export type Model = {
   enabled?: boolean;
   available?: boolean;
   unavailable_reason?: string;
+  reasoning_effort?: ReasoningEffort | null;
+  max_output_tokens: number;
   catalog?: CatalogDetails | null;
 };
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type CatalogDetails = {
   context_length: number | null;
   max_completion_tokens: number | null;
@@ -40,6 +43,16 @@ export type Connection = {
   last_checked_at: string | null;
   last_synced_at: string | null;
 };
+export type ProviderType = {
+  id: string;
+  label: string;
+  description: string;
+  supports_catalog: boolean;
+  verification: "metadata" | "model_trial";
+  requires_api_key: boolean;
+  requires_endpoint: boolean;
+  fixed_endpoint: string | null;
+};
 export type CatalogEntry = {
   id: string;
   model_id: string;
@@ -58,7 +71,7 @@ export type CatalogPage = {
   error: string;
 };
 export type Rule = {
-  kind: "manual" | "exact" | "contains" | "json_schema";
+  kind: "manual" | "exact" | "contains" | "choice" | "json_schema";
   expected?: string;
   schema?: Record<string, unknown>;
 };
@@ -67,11 +80,31 @@ export type Case = {
   messages: { role: "user" | "assistant"; content: string }[];
   rule: Rule;
   tags?: string[];
+  source?: {
+    dataset: string;
+    revision: string;
+    subject: string;
+    split: string;
+    row: number;
+    url: string;
+    license: string;
+    imported_from: string;
+  } | null;
 };
-export type Dataset = { id: string; name: string; cases: Case[] };
+export type Dataset = {
+  id: string;
+  name: string;
+  cases: Case[];
+  case_count?: number;
+  bundle_id?: string | null;
+  bundle_name?: string | null;
+  bundle_index?: number | null;
+  bundle_total?: number | null;
+};
 export type Prompt = { id: string; name: string; text: string };
 export type Run = {
   id: string;
+  batch_id?: string | null;
   name: string;
   status: string;
   created_at: string;
@@ -84,13 +117,50 @@ export type Run = {
   models: Model[];
   dataset_name: string;
 };
+export type Ranking = {
+  run_id: string;
+  batch_id: string | null;
+  name: string;
+  dataset_name: string;
+  run_count: number;
+  is_final: boolean;
+  status: string;
+  models: {
+    model_id: string;
+    name: string;
+    provider: string;
+    dynamic_model: boolean;
+    total: number;
+    completed: number;
+    failed: number;
+    cancelled: number;
+    graded: number;
+    passed: number;
+    pass_rate: number | null;
+  }[];
+};
 export type Item = {
   id: string;
   model_id: string;
   case_index: number;
   repeat_index: number;
   status: string;
-  attempts: { error?: string; status: string }[];
+  attempts: {
+    error?: string;
+    code?: string;
+    status: string;
+    diagnostics?: {
+      finish_reason?: string;
+      http_status?: number;
+      requested_max_tokens?: number | null;
+      completion_tokens?: number | null;
+      reasoning_tokens?: number | null;
+      resolved_model?: string | null;
+      elapsed_ms?: number;
+      timeout_kind?: string;
+      configured_timeout_seconds?: number;
+    };
+  }[];
   result: null | {
     output: string;
     latency_ms: number;
@@ -114,18 +184,19 @@ export type Detail = Run & {
 export async function api<T>(
   path: string,
   data?: unknown,
-  method = "POST",
+  method = data === undefined ? "GET" : "POST",
+  signal?: AbortSignal,
 ): Promise<T> {
-  const r = await fetch(
-    "/api" + path,
-    data === undefined
+  const r = await fetch("/api" + path, {
+    method,
+    signal,
+    ...(data === undefined
       ? {}
       : {
-          method,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(data),
-        },
-  );
+        }),
+  });
   if (!r.ok) {
     let message = "請求失敗";
     try {

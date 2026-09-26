@@ -1,4 +1,5 @@
 import json
+import re
 from jsonschema import validate, ValidationError
 
 def evaluate(text, rule):
@@ -8,6 +9,15 @@ def evaluate(text, rule):
     if kind == 'exact':
         passed = text.strip() == rule['expected'].strip()
         reason = '完全符合參考答案' if passed else '與參考答案不一致'
+    elif kind == 'choice':
+        match = re.fullmatch(
+            r'\s*(?:(?:答案|選項)\s*(?:是|為)?\s*[:：]?\s*|Answer\s*[:：]\s*)?'
+            r'[（(]?([A-D])[）)]?[.。]?\s*',
+            text,
+            flags=re.IGNORECASE,
+        )
+        passed = bool(match and match.group(1).upper() == rule['expected'].strip().upper())
+        reason = '選項符合參考答案' if passed else '選項與參考答案不一致或回答格式無法辨識'
     elif kind == 'contains':
         passed = rule['expected'].casefold() in text.casefold()
         reason = '包含指定文字' if passed else '未包含指定文字'

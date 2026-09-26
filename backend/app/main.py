@@ -22,7 +22,10 @@ from .db import (
     init_db,
     now,
 )
-from .schemas import ModelInput, DatasetInput, PromptInput, RunInput, ReviewInput
+from .schemas import (
+    ModelInput, TrialInput, DatasetInput, DatasetBundleInput, PromptInput,
+    RunInput, RunBatchInput, ReviewInput,
+)
 from .security import encrypt, cipher
 from .connections import (
     router as connections_router,
@@ -34,6 +37,7 @@ from .providers import generate, ProviderError
 from .execution import dispatch, reconcile
 from .evaluators import evaluate
 from .seed import seed
+from .tmmluplus import router as tmmluplus_router
 
 
 @asynccontextmanager
@@ -47,6 +51,7 @@ async def lifespan(app):
 
 app = FastAPI(title="ModelBenchLab API", version="0.2.0", lifespan=lifespan)
 app.include_router(connections_router)
+app.include_router(tmmluplus_router)
 
 
 @app.exception_handler(RequestValidationError)
@@ -82,6 +87,13 @@ def required(db, cls, identifier):
     return row
 
 
+def visible_run(db, identifier):
+    row = required(db, Run, identifier)
+    if row.deleted_at is not None:
+        raise HTTPException(404, "找不到測試紀錄")
+    return row
+
+
 def run_summary(db, run):
     items = db.scalars(select(Item).where(Item.run_id == run.id)).all()
     counts = Counter(i.status for i in items)
@@ -108,6 +120,7 @@ def run_summary(db, run):
         "avg_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
         "models": run.snapshot["models"],
         "dataset_name": run.snapshot["dataset_name"],
+        "batch_id": run.batch_id,
     }
 
 
@@ -144,7 +157,11 @@ def models():
     with Session() as db:
         return [
             public_model(m, db)
-            for m in db.scalars(select(Model).order_by(Model.created_at))
+            for m in db.scalars(
+                select(Model)
+                .where(Model.deleted_at.is_(None))
+                .order_by(Model.created_at)
+            )
         ]
 
 
@@ -173,10 +190,14 @@ def create_model(body: ModelInput):
 
 
 @app.post("/api/models/{identifier}/test")
-def test_model(identifier: str):
+def test_model(identifier: str, body: TrialInput | None = None):
     with Session() as db:
         row = required(db, Model, identifier)
-        settings = {"temperature": 0, "max_tokens": 8, "timeout": 15}
+        settings = {
+            "temperature": 0,
+            "max_tokens": row.max_output_tokens,
+            "timeout": (body or TrialInput()).timeout,
+        }
         config = validate_model(db, row, settings)
         version = None
         try:
@@ -204,8 +225,18 @@ def test_model(identifier: str):
 def datasets():
     with Session() as db:
         return [
-            {"id": d.id, "name": d.name, "cases": d.cases, "created_at": d.created_at}
-            for d in db.scalars(select(Dataset).order_by(Dataset.created_at.desc()))
+            {
+                "id": d.id, "name": d.name,
+                "cases": [] if d.bundle_id else d.cases,
+                "case_count": len(d.cases),
+                "bundle_id": d.bundle_id, "bundle_name": d.bundle_name,
+                "bundle_index": d.bundle_index, "bundle_total": d.bundle_total,
+                "created_at": d.created_at,
+            }
+            for d in db.scalars(
+                select(Dataset).where(Dataset.deleted_at.is_(None))
+                .order_by(Dataset.created_at.desc())
+            )
         ]
 
 
@@ -220,6 +251,43 @@ def create_dataset(body: DatasetInput):
         db.add(row)
         db.commit()
         return {"id": row.id}
+
+
+@app.post("/api/datasets/batch", status_code=201)
+def create_dataset_batch(body: DatasetBundleInput):
+    bundle_id = str(uuid4())
+    cases = [case.model_dump(by_alias=True) for case in body.cases]
+    total = (len(cases) + 999) // 1000
+    with Session() as db:
+        for index in range(total):
+            db.add(Dataset(
+                id=str(uuid4()),
+                name=f"{body.name} · 第 {index + 1}/{total} 批",
+                cases=cases[index * 1000:(index + 1) * 1000],
+                bundle_id=bundle_id,
+                bundle_name=body.name,
+                bundle_index=index + 1,
+                bundle_total=total,
+            ))
+        db.commit()
+    return {"bundle_id": bundle_id, "batches": total, "cases": len(cases)}
+
+
+@app.delete("/api/datasets/{identifier}")
+def delete_dataset(identifier: str):
+    with Session() as db:
+        row = required(db, Dataset, identifier)
+        if row.deleted_at is not None:
+            return {"deleted": True}
+        if row.bundle_id:
+            parts = db.scalars(select(Dataset).where(Dataset.bundle_id == row.bundle_id)).all()
+        else:
+            parts = [row]
+        deleted_at = now()
+        for part in parts:
+            part.deleted_at = deleted_at
+        db.commit()
+        return {"deleted": True, "batches": len(parts)}
 
 
 @app.get("/api/prompts")
@@ -245,14 +313,107 @@ def runs():
     with Session() as db:
         return [
             run_summary(db, r)
-            for r in db.scalars(select(Run).order_by(Run.created_at.desc()).limit(100))
+            for r in db.scalars(
+                select(Run).where(Run.deleted_at.is_(None))
+                .order_by(Run.created_at.desc()).limit(100)
+            )
         ]
+
+
+@app.get("/api/runs/{identifier}/ranking")
+def run_ranking(identifier: str):
+    with Session() as db:
+        run = visible_run(db, identifier)
+        parts = (
+            db.scalars(
+                select(Run).where(
+                    Run.batch_id == run.batch_id,
+                    Run.deleted_at.is_(None),
+                )
+            ).all()
+            if run.batch_id
+            else [run]
+        )
+        scores = {
+            model["id"]: {
+                "model_id": model["id"],
+                "name": model["name"],
+                "provider": model["provider"],
+                "dynamic_model": model["provider"] == "openrouter"
+                and (model.get("catalog") or {}).get("fixed_model") is False,
+                "total": 0,
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "graded": 0,
+                "passed": 0,
+            }
+            for model in run.snapshot["models"]
+        }
+        for model_id, status, passed in db.execute(
+            select(
+                Item.model_id,
+                Item.status,
+                Item.result["evaluation"]["passed"].as_boolean(),
+            ).where(
+                Item.run_id.in_([part.id for part in parts])
+            )
+        ):
+            score = scores.get(model_id)
+            if score is None:
+                continue
+            score["total"] += 1
+            if status == "failed":
+                score["failed"] += 1
+            if status == "cancelled":
+                score["cancelled"] += 1
+            if status == "completed":
+                score["completed"] += 1
+                if passed is True or passed is False:
+                    score["graded"] += 1
+                    score["passed"] += int(passed)
+        ranked = [
+            {
+                **score,
+                "pass_rate": round(100 * score["passed"] / score["graded"], 1)
+                if score["graded"]
+                else None,
+            }
+            for score in scores.values()
+        ]
+        ranked.sort(
+            key=lambda score: (
+                score["pass_rate"] is None,
+                -(score["pass_rate"] or 0),
+                -score["graded"],
+                score["name"].casefold(),
+            )
+        )
+        return {
+            "run_id": run.id,
+            "batch_id": run.batch_id,
+            "name": run.name,
+            "dataset_name": run.snapshot["dataset_name"],
+            "run_count": len(parts),
+            "is_final": not any(
+                part.status in ("queued", "running", "cancelling") for part in parts
+            ),
+            "status": (
+                "cancelled" if any(part.status == "cancelled" for part in parts)
+                else "running" if any(part.status in ("queued", "running", "cancelling") for part in parts)
+                else "completed_with_errors" if any(part.status in ("failed", "completed_with_errors") for part in parts)
+                else "completed"
+            ),
+            "models": ranked,
+        }
 
 
 @app.post("/api/runs", status_code=201)
 def create_run(body: RunInput):
     with Session() as db:
         dataset = required(db, Dataset, body.dataset_id)
+        if dataset.deleted_at is not None:
+            raise HTTPException(404, "找不到題庫")
         prompt = required(db, Prompt, body.prompt_id)
         selected = [
             validate_model(db, required(db, Model, mid), body.model_dump())
@@ -296,10 +457,82 @@ def create_run(body: RunInput):
     return result
 
 
+@app.post("/api/run-batches", status_code=201)
+def create_run_batch(body: RunBatchInput):
+    with Session() as db:
+        datasets = db.scalars(
+            select(Dataset).where(
+                Dataset.bundle_id == body.bundle_id,
+                Dataset.deleted_at.is_(None),
+            )
+            .order_by(Dataset.bundle_index)
+        ).all()
+        if not datasets or len(datasets) != datasets[0].bundle_total or any(
+            dataset.bundle_index != index + 1 for index, dataset in enumerate(datasets)
+        ):
+            raise HTTPException(404, "找不到完整的分批題庫")
+        prompt = required(db, Prompt, body.prompt_id)
+        selected = [
+            validate_model(db, required(db, Model, mid), body.model_dump())
+            for mid in body.model_ids
+        ]
+        total_cases = sum(len(dataset.cases) for dataset in datasets)
+        total_jobs = total_cases * len(selected) * body.repeats
+        if total_jobs > 50000:
+            raise HTTPException(422, "整批測試最多 50000 個工作項目，請減少模型或重複次數")
+        cases_per_run = 5000 // (len(selected) * body.repeats)
+        parts = [
+            (dataset, dataset.cases[start:start + cases_per_run])
+            for dataset in datasets
+            for start in range(0, len(dataset.cases), cases_per_run)
+        ]
+        batch_id = str(uuid4())
+        run_ids = []
+        item_ids = []
+        for index, (dataset, cases) in enumerate(parts, start=1):
+            run = Run(
+                id=str(uuid4()),
+                name=f"{body.name[:95]} · {index}/{len(parts)}",
+                batch_id=batch_id,
+                snapshot={
+                    "version": 2,
+                    "dataset_id": dataset.id,
+                    "dataset_name": f"{dataset.bundle_name} · {index}/{len(parts)}",
+                    "cases": cases,
+                    "prompt": {"id": prompt.id, "name": prompt.name, "text": prompt.text},
+                    "models": selected,
+                    "settings": body.model_dump(
+                        include={"repeats", "temperature", "max_tokens", "timeout"}
+                    ),
+                },
+            )
+            db.add(run)
+            db.flush()
+            run_ids.append(run.id)
+            for model in selected:
+                for case_index in range(len(cases)):
+                    for repeat in range(body.repeats):
+                        item = Item(
+                            id=str(uuid4()), run_id=run.id, model_id=model["id"],
+                            case_index=case_index, repeat_index=repeat,
+                        )
+                        db.add(item)
+                        item_ids.append(item.id)
+        db.commit()
+    try:
+        dispatch(item_ids[:500])
+    except Exception:
+        pass  # The periodic sweeper dispatches every queued item.
+    return {
+        "batch_id": batch_id, "run_ids": run_ids,
+        "runs": len(run_ids), "cases": total_cases, "jobs": total_jobs,
+    }
+
+
 @app.get("/api/runs/{identifier}")
 def run_detail(identifier: str):
     with Session() as db:
-        run = required(db, Run, identifier)
+        run = visible_run(db, identifier)
         items = db.scalars(
             select(Item)
             .where(Item.run_id == identifier)
@@ -327,10 +560,34 @@ def run_detail(identifier: str):
         }
 
 
+@app.delete("/api/runs/{identifier}")
+def delete_run(identifier: str):
+    with Session() as db:
+        run = required(db, Run, identifier)
+        if run.deleted_at is not None:
+            return {"deleted": True}
+        group = db.scalars(select(Run).where(Run.batch_id == run.batch_id)).all() if run.batch_id else [run]
+        if any(part.status in ("queued", "running", "cancelling") for part in group):
+            raise HTTPException(409, "這批測試仍在執行；請先取消並等待全部停止")
+        pending = db.scalar(
+            select(Item.id).where(
+                Item.run_id.in_([part.id for part in group]),
+                Item.status.in_(("queued", "running")),
+            ).limit(1)
+        )
+        if pending:
+            raise HTTPException(409, "這批測試仍有排隊或執行中的工作；請先等待停止")
+        deleted_at = now()
+        for part in group:
+            part.deleted_at = deleted_at
+        db.commit()
+        return {"deleted": True, "runs": len(group)}
+
+
 @app.post("/api/runs/{identifier}/cancel")
 def cancel_run(identifier: str):
     with Session() as db:
-        run = required(db, Run, identifier)
+        run = visible_run(db, identifier)
         if run.status not in ("queued", "running", "cancelling"):
             raise HTTPException(409, "此測試已結束")
         run.status = "cancelling"
@@ -347,7 +604,7 @@ def cancel_run(identifier: str):
 @app.post("/api/runs/{identifier}/retry", status_code=201)
 def retry_run(identifier: str):
     with Session() as db:
-        old = required(db, Run, identifier)
+        old = visible_run(db, identifier)
         if old.status in ("queued", "running", "cancelling"):
             raise HTTPException(409, "請等待測試結束")
         failed = db.scalars(
@@ -356,7 +613,16 @@ def retry_run(identifier: str):
         if not failed:
             raise HTTPException(409, "沒有失敗工作可重跑")
         for mid in {i.model_id for i in failed}:
-            validate_model(db, required(db, Model, mid), old.snapshot["settings"])
+            previous = next(m for m in old.snapshot["models"] if m["id"] == mid)
+            validate_model(
+                db,
+                required(db, Model, mid),
+                {
+                    **old.snapshot["settings"],
+                    "max_tokens": old.snapshot["settings"].get("max_tokens")
+                    or previous.get("max_output_tokens", 32768),
+                },
+            )
         new = Run(
             id=str(uuid4()),
             name=(old.name[:100] + " · 重跑"),
@@ -387,6 +653,7 @@ def retry_run(identifier: str):
 def review(identifier: str, body: ReviewInput):
     with Session() as db:
         item = required(db, Item, identifier)
+        visible_run(db, item.run_id)
         if item.status != "completed":
             raise HTTPException(409, "此項目尚無回答")
         db.add(Review(id=str(uuid4()), item_id=item.id, **body.model_dump()))
@@ -398,6 +665,7 @@ def review(identifier: str, body: ReviewInput):
 def re_evaluate(identifier: str):
     with Session() as db:
         item = required(db, Item, identifier)
+        visible_run(db, item.run_id)
         if not item.result:
             raise HTTPException(409, "此項目尚無回答")
         run = db.get(Run, item.run_id)
@@ -486,7 +754,7 @@ def export(identifier: str, format: str = "json"):
 @app.get("/api/runs/{identifier}/events")
 async def events(identifier: str, request: Request):
     with Session() as db:
-        required(db, Run, identifier)
+        visible_run(db, identifier)
 
     async def stream():
         while not await request.is_disconnected():

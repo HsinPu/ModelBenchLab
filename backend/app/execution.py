@@ -75,7 +75,11 @@ def execute_item(item_id):
             if snapshot["prompt"]["text"]
             else []
         ) + case["messages"]
-        settings = snapshot["settings"]
+        settings = {
+            **snapshot["settings"],
+            "max_tokens": snapshot["settings"].get("max_tokens")
+            or config.get("max_output_tokens", 32768),
+        }
         attempts = []
         result = None
         for attempt in range(3):
@@ -106,6 +110,7 @@ def execute_item(item_id):
                         "error": str(error),
                         "code": error.code,
                         "retry_after": error.retry_after,
+                        "diagnostics": error.diagnostics,
                     }
                 )
                 cid = config.get("connection_id") or model.connection_id
@@ -163,7 +168,7 @@ def execute_item(item_id):
 def recover_stale():
     # Do not automatically replay uncertain calls: the provider may have charged them.
     with Session() as db:
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
         stale = db.scalars(
             select(Item).where(Item.status == "running", Item.started_at < cutoff)
         ).all()

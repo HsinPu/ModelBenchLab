@@ -118,8 +118,20 @@ def test_legacy_upgrade_preserves_ids_keys_and_history(tmp_path):
             connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar()
-            == "0002"
+            == "0008"
         )
+        assert (
+            connection.execute(
+                sa.select(meta.tables["model_configs"].c.deleted_at)
+            ).scalar()
+            is None
+        )
+        assert all(model["reasoning_effort"] is None for model in models)
+        assert all(model["max_output_tokens"] == 32768 for model in models)
+        assert "bundle_id" in meta.tables["dataset_versions"].c
+        assert "deleted_at" in meta.tables["dataset_versions"].c
+        assert "batch_id" in meta.tables["runs"].c
+        assert "deleted_at" in meta.tables["runs"].c
     backups = list(tmp_path.glob("*.bak"))
     assert len(backups) == 1
     backup_engine = sa.create_engine("sqlite:///" + str(backups[0]))

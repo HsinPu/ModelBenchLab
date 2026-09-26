@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from app.db import Session, Item, Model, Run
 from app.execution import execute_item, recover_stale
@@ -81,6 +82,18 @@ def test_stale_worker_not_automatically_replayed(client):
     data=client.get('/api/runs/'+rid).json()
     assert data['status']=='completed_with_errors'
     assert data['counts']=={'failed':1}
+
+
+def test_long_network_wait_is_not_recovered_as_stale(client):
+    rid=setup_run(client,models=1)
+    with Session() as db:
+        item=db.scalar(select(Item).where(Item.run_id==rid))
+        item.status='running'
+        item.started_at=(datetime.now(timezone.utc)-timedelta(minutes=13)).isoformat()
+        db.get(Run,rid).status='running'
+        db.commit()
+    recover_stale()
+    assert client.get('/api/runs/'+rid).json()['counts']=={'running':1}
 
 def test_validation_and_missing(client):
     assert client.get('/api/runs/missing').status_code==404

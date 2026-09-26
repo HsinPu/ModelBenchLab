@@ -54,7 +54,10 @@ class Model(Base):
     )
     enabled: Mapped[bool] = mapped_column(default=True)
     routing: Mapped[dict] = mapped_column(JSON, default=dict)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    max_output_tokens: Mapped[int] = mapped_column(default=32768)
     created_at: Mapped[str] = mapped_column(String(40), default=now)
+    deleted_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
 
 class ProviderConnection(Base):
@@ -98,7 +101,12 @@ class Dataset(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(100))
     cases: Mapped[list] = mapped_column(JSON)
+    bundle_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    bundle_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    bundle_index: Mapped[int | None] = mapped_column(nullable=True)
+    bundle_total: Mapped[int | None] = mapped_column(nullable=True)
     created_at: Mapped[str] = mapped_column(String(40), default=now)
+    deleted_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
 
 class Prompt(Base):
@@ -115,8 +123,10 @@ class Run(Base):
     name: Mapped[str] = mapped_column(String(120))
     status: Mapped[str] = mapped_column(String(30), default="queued")
     snapshot: Mapped[dict] = mapped_column(JSON)
+    batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[str] = mapped_column(String(40), default=now)
     finished_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    deleted_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
 
 class Item(Base):
