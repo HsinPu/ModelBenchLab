@@ -1,10 +1,47 @@
+import asyncio
 import json
 import httpx
 import pytest
-from app.providers import generate, ProviderError
+from app.providers import generate, ProviderError, _cancellable_post
 
 CONFIG={'provider':'openai-compatible','endpoint':'https://model.example/v1','model':'test'}
 SETTINGS={'timeout':5,'temperature':0,'max_tokens':10}
+
+
+def test_force_cancel_aborts_pending_http_request(monkeypatch):
+    real_client = httpx.AsyncClient
+    started = asyncio.Event()
+    interrupted = asyncio.Event()
+    cancelled = {'value': False}
+
+    async def handle(_):
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            interrupted.set()
+            raise
+        return httpx.Response(200, json={'choices': [{'message': {'content': 'late'}}]})
+
+    transport = httpx.MockTransport(handle)
+    monkeypatch.setattr(
+        'app.providers.httpx.AsyncClient',
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+
+    async def run():
+        async def request_cancel():
+            await started.wait()
+            cancelled['value'] = True
+
+        trigger = asyncio.create_task(request_cancel())
+        with pytest.raises(ProviderError) as error:
+            await _cancellable_post('https://model.example/v1', {}, {}, 5, lambda: cancelled['value'])
+        await trigger
+        assert error.value.code == 'force_cancelled'
+        assert interrupted.is_set()
+
+    asyncio.run(run())
 
 def test_adapter_request_and_usage():
     def handle(request):
@@ -50,6 +87,19 @@ def test_no_text_response_has_actionable_error(choice, expected):
         assert error.value.diagnostics['reasoning_tokens'] == 5
         assert error.value.diagnostics['resolved_model'] == 'maker/resolved'
         assert error.value.diagnostics['requested_max_tokens'] == 10
+
+
+def test_openrouter_no_text_preserves_reported_cost_without_response_body():
+    response = {
+        'choices': [{'message': {'content': ''}, 'finish_reason': 'length'}],
+        'usage': {'cost': 0.00005, 'completion_tokens': 10},
+    }
+    config = {**CONFIG, 'provider': 'openrouter'}
+    with httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response))) as client:
+        with pytest.raises(ProviderError) as error:
+            generate(config, [], SETTINGS, 'private', client)
+    assert error.value.code == 'no_text_output'
+    assert error.value.diagnostics['reported_cost_usd'] == '0.00005'
 
 
 @pytest.mark.parametrize('provider, effort, field', [

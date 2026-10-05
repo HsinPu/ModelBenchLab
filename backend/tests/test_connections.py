@@ -17,7 +17,7 @@ def entry(mid="maker/text", **overrides):
         "context_length": 32000,
         "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
         "supported_parameters": ["temperature", "max_tokens", "tools"],
-        "top_provider": {"max_completion_tokens": 65536},
+        "top_provider": {"max_completion_tokens": 128000},
         "pricing": {"prompt": "0", "completion": "0"},
         **overrides,
     }
@@ -83,7 +83,7 @@ def test_reasoning_effort_is_editable_and_snapshotted(client, upstream, monkeypa
 
     monkeypatch.setattr("app.main.generate", trial)
     assert client.post(f"/api/models/{mid}/test").status_code == 200
-    assert captured == [("low", 32768, "test-key-not-real")]
+    assert captured == [("low", 128000, "test-key-not-real")]
 
     first = run_with(client, mid)
     assert first.status_code == 201
@@ -104,7 +104,7 @@ def test_reasoning_effort_is_editable_and_snapshotted(client, upstream, monkeypa
 def test_output_token_limit_defaults_edits_and_run_snapshots(client, upstream, monkeypatch):
     cid = connect(client, upstream)
     mid = imported(client, cid)
-    assert client.get("/api/models").json()[0]["max_output_tokens"] == 32768
+    assert client.get("/api/models").json()[0]["max_output_tokens"] == 128000
 
     captured = []
     monkeypatch.setattr(
@@ -115,20 +115,20 @@ def test_output_token_limit_defaults_edits_and_run_snapshots(client, upstream, m
         ),
     )
     assert client.post(f"/api/models/{mid}/test").status_code == 200
-    assert captured == [32768]
+    assert captured == [128000]
 
     first = run_with(client, mid)
     assert first.status_code == 201
     first_id = first.json()["id"]
     original = client.get(f"/api/runs/{first_id}").json()["snapshot"]
-    assert original["models"][0]["max_output_tokens"] == 32768
+    assert original["models"][0]["max_output_tokens"] == 128000
     assert original["settings"]["max_tokens"] is None
 
     updated = client.patch(f"/api/models/{mid}", json={"max_output_tokens": 4096})
     assert updated.status_code == 200
     assert updated.json()["max_output_tokens"] == 4096
     assert client.post(f"/api/models/{mid}/test").status_code == 200
-    assert captured == [32768, 4096]
+    assert captured == [128000, 4096]
     second = run_with(client, mid)
     assert second.status_code == 201
     second_snapshot = client.get(f"/api/runs/{second.json()['id']}").json()["snapshot"]
@@ -146,7 +146,7 @@ def test_output_token_limit_defaults_edits_and_run_snapshots(client, upstream, m
     )
     for rid in (first_id, second.json()["id"], override.json()["id"]):
         assert execute_run(client, rid)["counts"] == {"completed": 1}
-    assert observed == [32768, 4096, 2048]
+    assert observed == [128000, 4096, 2048]
     assert client.get(f"/api/runs/{first_id}").json()["snapshot"] == original
 
     source = run_with(client, mid)

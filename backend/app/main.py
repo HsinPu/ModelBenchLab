@@ -36,6 +36,8 @@ from .connections import (
 from .providers import generate, ProviderError
 from .execution import dispatch, reconcile
 from .evaluators import evaluate
+from .costs import summarize_costs
+from .rankings import dataset_ranking
 from .seed import seed
 from .tmmluplus import router as tmmluplus_router
 
@@ -118,6 +120,7 @@ def run_summary(db, run):
         if graded
         else None,
         "avg_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
+        "cost_summary": summarize_costs(items, run.snapshot["models"]),
         "models": run.snapshot["models"],
         "dataset_name": run.snapshot["dataset_name"],
         "batch_id": run.batch_id,
@@ -408,6 +411,12 @@ def run_ranking(identifier: str):
         }
 
 
+@app.get("/api/runs/{identifier}/dataset-ranking")
+def run_dataset_ranking(identifier: str):
+    with Session() as db:
+        return dataset_ranking(db, visible_run(db, identifier))
+
+
 @app.post("/api/runs", status_code=201)
 def create_run(body: RunInput):
     with Session() as db:
@@ -599,6 +608,41 @@ def cancel_run(identifier: str):
         db.commit()
     reconcile(identifier)
     return {"ok": True}
+
+
+@app.post("/api/runs/{identifier}/force-cancel")
+def force_cancel_run(identifier: str):
+    with Session() as db:
+        run = visible_run(db, identifier)
+        group = (
+            db.scalars(select(Run).where(Run.batch_id == run.batch_id)).all()
+            if run.batch_id
+            else [run]
+        )
+        active_ids = [
+            part.id
+            for part in group
+            if part.status in ("queued", "running", "cancelling")
+        ]
+        if not active_ids:
+            raise HTTPException(409, "此測試已結束")
+        finished_at = now()
+        # A batch is one user test. Stop every unfinished segment together.
+        stopped_runs = db.execute(
+            update(Run)
+            .where(Run.id.in_(active_ids), Run.status.in_(("queued", "running", "cancelling")))
+            .values(status="cancelled", finished_at=finished_at)
+        )
+        if not stopped_runs.rowcount:
+            db.rollback()
+            raise HTTPException(409, "此測試已結束")
+        stopped = db.execute(
+            update(Item)
+            .where(Item.run_id.in_(active_ids), Item.status.in_(("queued", "running")))
+            .values(status="cancelled", finished_at=finished_at)
+        )
+        db.commit()
+        return {"ok": True, "runs": stopped_runs.rowcount, "cancelled_items": stopped.rowcount}
 
 
 @app.post("/api/runs/{identifier}/retry", status_code=201)

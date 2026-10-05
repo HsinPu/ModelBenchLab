@@ -18,7 +18,7 @@ class ModelInput(BaseModel):
     model: str = Field(min_length=1, max_length=200)
     api_key: str = Field(default='', max_length=4000)
     reasoning_effort: ReasoningEffort | None = None
-    max_output_tokens: int = Field(default=32768, ge=1, le=131072)
+    max_output_tokens: int = Field(default=128000, ge=1, le=131072)
     @model_validator(mode='after')
     def endpoint_valid(self):
         if self.provider == 'openai-compatible':

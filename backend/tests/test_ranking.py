@@ -1,5 +1,4 @@
-from app.db import Item, Run, Session
-
+from app.db import Dataset, Item, Run, Session
 
 MODELS = [
     {"id": "a", "name": "Alpha", "provider": "openai-compatible"},
@@ -75,3 +74,90 @@ def test_ranking_compares_only_same_run_batch_and_excludes_ungraded(client):
 
 def test_ranking_missing_run(client):
     assert client.get("/api/runs/missing/ranking").status_code == 404
+
+
+def test_dataset_ranking_compares_runs_without_promoting_partial_results(client):
+    cases = [{"input": f"question {number}"} for number in range(3)]
+    qwen = {"id": "qwen", "name": "Qwen", "provider": "openrouter"}
+    glm = {"id": "glm", "name": "GLM", "provider": "openrouter"}
+    with Session() as db:
+        db.add_all([
+            Dataset(id="bank", name="TMMLU+", cases=cases),
+            Dataset(id="other-bank", name="TMMLU+", cases=cases),
+        ])
+        db.add_all([
+            Run(id="qwen-old", name="Qwen old", status="completed", created_at="2026-09-24T00:00:00", snapshot={"dataset_id": "bank", "dataset_name": "TMMLU+", "cases": cases, "models": [qwen]}),
+            Run(id="qwen", name="Qwen", status="completed_with_errors", created_at="2026-09-25T00:00:00", snapshot={"dataset_id": "bank", "dataset_name": "TMMLU+", "cases": cases, "models": [qwen]}),
+            Run(id="glm", name="GLM", status="running", created_at="2026-09-26T00:00:00", snapshot={"dataset_id": "bank", "dataset_name": "TMMLU+", "cases": cases, "models": [glm]}),
+            Run(id="glm-retry", name="GLM retry", status="completed", created_at="2026-09-27T00:00:00", snapshot={"dataset_id": "bank", "dataset_name": "TMMLU+", "cases": cases, "models": [glm], "retry_of": "glm"}),
+            Run(id="other", name="Other", status="completed", created_at="2026-09-26T00:00:00", snapshot={"dataset_id": "other-bank", "dataset_name": "TMMLU+", "cases": cases, "models": [{"id": "other", "name": "Other", "provider": "demo"}]}),
+        ])
+        db.flush()
+        db.add_all([
+            Item(id="old", run_id="qwen-old", model_id="qwen", case_index=0, repeat_index=0, status="completed", result=result(True)),
+            Item(id="q1", run_id="qwen", model_id="qwen", case_index=0, repeat_index=0, status="completed", result=result(True)),
+            Item(id="q2", run_id="qwen", model_id="qwen", case_index=1, repeat_index=0, status="completed", result=result(False)),
+            Item(id="q3", run_id="qwen", model_id="qwen", case_index=2, repeat_index=0, status="failed"),
+            Item(id="g1", run_id="glm", model_id="glm", case_index=0, repeat_index=0, status="completed", result=result(True)),
+            Item(id="g2", run_id="glm", model_id="glm", case_index=1, repeat_index=0, status="queued"),
+            Item(id="g3", run_id="glm", model_id="glm", case_index=2, repeat_index=0, status="queued"),
+            Item(id="gr", run_id="glm-retry", model_id="glm", case_index=1, repeat_index=0, status="completed", result=result(True)),
+            Item(id="other-item", run_id="other", model_id="other", case_index=0, repeat_index=0, status="completed", result=result(True)),
+        ])
+        db.commit()
+
+    response = client.get("/api/runs/glm-retry/dataset-ranking")
+    assert response.status_code == 200
+    ranking = response.json()
+    assert ranking["dataset_name"] == "TMMLU+"
+    assert ranking["question_count"] == 3
+    assert ranking["is_final"] is False
+    assert [model["model_id"] for model in ranking["models"]] == ["qwen", "glm"]
+    assert ranking["models"][0]["pass_rate"] == 50.0
+    assert ranking["models"][0]["total"] == 3
+    assert ranking["models"][0]["failed"] == 1
+    assert ranking["models"][0]["ranked"] is True
+    assert ranking["models"][1]["pass_rate"] == 100.0
+    assert ranking["models"][1]["graded"] == 1
+    assert ranking["models"][1]["ranked"] is False
+    assert ranking["models"][1]["provisional"] is True
+
+    with Session() as db:
+        db.get(Run, "qwen").deleted_at = "2026-09-27"
+        db.commit()
+    assert client.get("/api/runs/qwen/dataset-ranking").status_code == 404
+    remaining = client.get("/api/runs/glm/dataset-ranking").json()["models"]
+    assert {model["model_id"] for model in remaining} == {"qwen", "glm"}
+    assert all(model["ranked"] is False for model in remaining)
+    assert client.get("/api/runs/other/dataset-ranking").json()["models"][0]["model_id"] == "other"
+
+
+def test_dataset_ranking_merges_complete_batches_only(client):
+    alpha = {"id": "a", "name": "Alpha", "provider": "demo"}
+    beta = {"id": "b", "name": "Beta", "provider": "demo"}
+    snapshots = {
+        "first": {"dataset_id": "first", "dataset_name": "Bank 1/2", "cases": [{"input": "one"}]},
+        "second": {"dataset_id": "second", "dataset_name": "Bank 2/2", "cases": [{"input": "two"}]},
+    }
+    with Session() as db:
+        db.add_all([
+            Dataset(id="first", name="Bank 1/2", cases=snapshots["first"]["cases"], bundle_id="bundle", bundle_name="Bank", bundle_index=1, bundle_total=2),
+            Dataset(id="second", name="Bank 2/2", cases=snapshots["second"]["cases"], bundle_id="bundle", bundle_name="Bank", bundle_index=2, bundle_total=2),
+        ])
+        for model, batch, stamp in ((alpha, "batch-a", "2026-09-25"), (beta, "batch-b", "2026-09-26")):
+            for dataset_id in ("first", "second"):
+                db.add(Run(id=f"{batch}-{dataset_id}", name=batch, status="completed", batch_id=batch, created_at=stamp, snapshot={**snapshots[dataset_id], "models": [model]}))
+        db.add(Run(id="partial", name="partial", status="completed", created_at="2026-09-27", snapshot={**snapshots["first"], "models": [{"id": "partial", "name": "Partial", "provider": "demo"}]}))
+        db.flush()
+        for batch, model_id, passed in (("batch-a", "a", True), ("batch-b", "b", False)):
+            for dataset_id in ("first", "second"):
+                db.add(Item(id=f"{batch}-{dataset_id}-item", run_id=f"{batch}-{dataset_id}", model_id=model_id, case_index=0, repeat_index=0, status="completed", result=result(passed)))
+        db.add(Item(id="partial-item", run_id="partial", model_id="partial", case_index=0, repeat_index=0, status="completed", result=result(True)))
+        db.commit()
+
+    ranking = client.get("/api/runs/batch-b-second/dataset-ranking").json()
+    assert ranking["dataset_name"] == "Bank"
+    assert ranking["question_count"] == 2
+    assert [model["model_id"] for model in ranking["models"]] == ["a", "b"]
+    assert [model["total"] for model in ranking["models"]] == [2, 2]
+    assert [model["pass_rate"] for model in ranking["models"]] == [100.0, 0.0]

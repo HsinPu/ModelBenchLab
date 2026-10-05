@@ -26,9 +26,11 @@ def wait_for_retry(db, run, delay):
 def reconcile(run_id):
     with Session() as db:
         run = db.get(Run, run_id)
+        if run.status in TERMINAL or run.status == "completed_with_errors":
+            return
         items = db.scalars(select(Item).where(Item.run_id == run_id)).all()
         if all(i.status in TERMINAL for i in items):
-            run.status = (
+            final_status = (
                 "cancelled"
                 if run.status in ("cancelling", "cancelled")
                 else (
@@ -37,7 +39,12 @@ def reconcile(run_id):
                     else "completed"
                 )
             )
-            run.finished_at = now()
+            # A force-cancel may commit after this read. Never overwrite it.
+            db.execute(
+                update(Run)
+                .where(Run.id == run_id, Run.status == run.status)
+                .values(status=final_status, finished_at=now())
+            )
             db.commit()
 
 
@@ -80,6 +87,15 @@ def execute_item(item_id):
             "max_tokens": snapshot["settings"].get("max_tokens")
             or config.get("max_output_tokens", 32768),
         }
+        def force_cancelled():
+            with Session() as check_db:
+                return check_db.scalar(
+                    select(Run.status).where(Run.id == run_id)
+                ) == "cancelled"
+
+        # The provider polls this while an HTTP request is pending and closes
+        # its local connection on force-cancel. It is never part of the Run snapshot.
+        settings["_force_cancelled"] = force_cancelled
         attempts = []
         result = None
         for attempt in range(3):
@@ -123,8 +139,14 @@ def execute_item(item_id):
                         )
                         .values(status="invalid", error=str(error))
                     )
-                item.attempts = list(attempts)
+                recorded = db.execute(
+                    update(Item)
+                    .where(Item.id == item_id, Item.status == "running")
+                    .values(attempts=list(attempts))
+                )
                 db.commit()
+                if not recorded.rowcount:
+                    break
                 if not error.retryable or attempt == 2:
                     break
                 delay = (
@@ -144,6 +166,9 @@ def execute_item(item_id):
                 )
                 break
         db.refresh(run)
+        db.refresh(item)
+        if item.status != "running":
+            return
         if result is not None:
             try:
                 result["evaluation"] = evaluate(result["output"], case["rule"])
@@ -153,14 +178,21 @@ def execute_item(item_id):
                     "reason": "評分失敗，可重新評分",
                     "error": True,
                 }
-            item.result = result
-            item.status = "completed"
+            final_status = "completed"
         else:
-            item.status = (
+            final_status = (
                 "cancelled" if run.status in ("cancelling", "cancelled") else "failed"
             )
-        item.attempts = attempts
-        item.finished_at = now()
+        db.execute(
+            update(Item)
+            .where(Item.id == item_id, Item.status == "running")
+            .values(
+                status=final_status,
+                result=result,
+                attempts=attempts,
+                finished_at=now(),
+            )
+        )
         db.commit()
     reconcile(run_id)
 
@@ -174,15 +206,22 @@ def recover_stale():
         ).all()
         ids = set()
         for item in stale:
-            item.status = "failed"
-            item.finished_at = now()
-            item.attempts = item.attempts + [
-                {
-                    "status": "failed",
-                    "error": "Worker 中斷或工作逾期；請手動重跑，避免重複計費",
-                }
-            ]
-            ids.add(item.run_id)
+            recovered = db.execute(
+                update(Item)
+                .where(Item.id == item.id, Item.status == "running")
+                .values(
+                    status="failed",
+                    finished_at=now(),
+                    attempts=item.attempts + [
+                        {
+                            "status": "failed",
+                            "error": "Worker 中斷或工作逾期；請手動重跑，避免重複計費",
+                        }
+                    ],
+                )
+            )
+            if recovered.rowcount:
+                ids.add(item.run_id)
         db.commit()
     for run_id in ids:
         reconcile(run_id)

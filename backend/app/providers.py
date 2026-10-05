@@ -1,7 +1,33 @@
+import asyncio
 import time
+from contextlib import suppress
 import httpx
 from .openrouter import validate_key
 from .openrouter import ProviderError, BASE_URL, DEFAULT_ROUTING, check_response, price
+
+
+async def _cancellable_post(endpoint, headers, payload, timeout, cancelled):
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        if cancelled():
+            raise ProviderError("測試已強制取消", code="force_cancelled")
+        request = asyncio.create_task(
+            client.post(endpoint + "/chat/completions", headers=headers, json=payload)
+        )
+        try:
+            while True:
+                if cancelled():
+                    request.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await request
+                    raise ProviderError("測試已強制取消", code="force_cancelled")
+                done, _ = await asyncio.wait({request}, timeout=0.5)
+                if done:
+                    return await request
+        finally:
+            if not request.done():
+                request.cancel()
+                with suppress(asyncio.CancelledError):
+                    await request
 
 
 def generate(config, messages, settings, key="", client=None):
@@ -38,8 +64,11 @@ def generate(config, messages, settings, key="", client=None):
             "demo": True,
         }
     validate_key(key)
-    own = client is None
-    client = client or httpx.Client(timeout=settings["timeout"], follow_redirects=False)
+    cancelled = settings.get("_force_cancelled")
+    cancellable = client is None and callable(cancelled)
+    own = client is None and not cancellable
+    if own:
+        client = httpx.Client(timeout=settings["timeout"], follow_redirects=False)
     try:
         routed = config["provider"] == "openrouter"
         catalog = config.get("catalog") if routed else None
@@ -65,8 +94,12 @@ def generate(config, messages, settings, key="", client=None):
             else:
                 payload["reasoning_effort"] = effort
         endpoint = BASE_URL if routed else config["endpoint"].rstrip("/")
-        response = client.post(
-            endpoint + "/chat/completions", headers=headers, json=payload
+        response = (
+            asyncio.run(
+                _cancellable_post(endpoint, headers, payload, settings["timeout"], cancelled)
+            )
+            if cancellable
+            else client.post(endpoint + "/chat/completions", headers=headers, json=payload)
         )
         try:
             check_response(response)
@@ -82,6 +115,7 @@ def generate(config, messages, settings, key="", client=None):
         usage = data.get("usage") or {}
         if not isinstance(usage, dict):
             raise ValueError("Invalid usage")
+        reported_charge = price(usage.get("cost")) if routed else None
 
         def token(field):
             value = usage.get(field)
@@ -117,6 +151,7 @@ def generate(config, messages, settings, key="", client=None):
                 else None,
                 "resolved_model": identifier("model"),
                 "elapsed_ms": round((time.perf_counter() - start) * 1000),
+                "reported_cost_usd": reported_charge,
             }
             if choice.get("finish_reason") == "length":
                 raise ProviderError(
@@ -133,6 +168,7 @@ def generate(config, messages, settings, key="", client=None):
             raise ProviderError(
                 "模型回傳非文字內容，目前只支援 chat/completions 文字回答",
                 code="non_text_output",
+                diagnostics={"reported_cost_usd": reported_charge},
             )
         return {
             "output": output,
@@ -146,9 +182,9 @@ def generate(config, messages, settings, key="", client=None):
             "resolved_model": identifier("model"),
             "upstream_provider": identifier("provider"),
             "generation_id": identifier("id"),
-            "cost": price(usage.get("cost")) if routed else None,
+            "cost": reported_charge,
             "cost_source": "openrouter_usage"
-            if routed and price(usage.get("cost")) is not None
+            if reported_charge is not None
             else None,
             "routing": payload.get("provider"),
         }

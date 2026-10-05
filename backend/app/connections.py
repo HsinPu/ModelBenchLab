@@ -42,7 +42,7 @@ class ConnectionUpdate(BaseModel):
 class ImportModels(BaseModel):
     model_ids: list[str] = Field(min_length=1, max_length=100)
     reasoning_effort: ReasoningEffort | None = None
-    max_output_tokens: int = Field(default=32768, ge=1, le=131072)
+    max_output_tokens: int = Field(default=128000, ge=1, le=131072)
 
 
 class ModelUpdate(BaseModel):
@@ -67,7 +67,7 @@ class ManualModelInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     model_id: str = Field(min_length=1, max_length=200)
     reasoning_effort: ReasoningEffort | None = None
-    max_output_tokens: int = Field(default=32768, ge=1, le=131072)
+    max_output_tokens: int = Field(default=128000, ge=1, le=131072)
 
 
 def required(db, cls, identifier):

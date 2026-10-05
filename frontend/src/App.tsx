@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArrowDownToLine,
@@ -13,8 +13,6 @@ import {
   Play,
   RefreshCw,
   Settings2,
-  Sparkles,
-  Terminal,
   TextCursorInput,
   Trash2,
   X,
@@ -36,6 +34,8 @@ const labels: Record<string, string> = {
   cancelled: "已取消",
 };
 const active = (s: string) => ["queued", "running", "cancelling"].includes(s);
+const RESULT_PAGE_SIZE = 20;
+type CaseGroup = { caseIndex: number; repeatIndex: number; case: Case; rows: Item[] };
 const formatTime = (s: string) =>
   new Date(s).toLocaleString("zh-TW", {
     month: "2-digit",
@@ -72,9 +72,12 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [online, setOnline] = useState(false);
   const [filter, setFilter] = useState("all");
+  const [resultPage, setResultPage] = useState(1);
+  const [expandedCase, setExpandedCase] = useState<string | null>(null);
   const [datasetName, setDatasetName] = useState("");
   const [deletingDataset, setDeletingDataset] = useState<Dataset | null>(null);
   const [deletingRun, setDeletingRun] = useState<Run | null>(null);
+  const [forceCancellingRun, setForceCancellingRun] = useState<Run | null>(null);
   const [cases, setCases] = useState<Case[]>([{ ...initialCase }]);
   const [jsonMode, setJsonMode] = useState(false);
   const [caseJson, setCaseJson] = useState("");
@@ -134,6 +137,10 @@ export default function App() {
     };
     return () => source.close();
   }, [detail?.id, detail?.status]);
+  useEffect(() => {
+    setResultPage(1);
+    setExpandedCase(null);
+  }, [detail?.id]);
   async function action(fn: () => Promise<void>) {
     if (busy) return;
     setBusy(true);
@@ -212,6 +219,45 @@ export default function App() {
     active(deletingRun.status) ||
     (!!deletingRun.batch_id && runs.some((r) => r.batch_id === deletingRun.batch_id && active(r.status)))
   );
+  const caseGroups = useMemo(() => {
+    if (!detail) return [];
+    const groups = new Map<string, CaseGroup>();
+    for (const item of detail.items) {
+      const sample = detail.snapshot.cases[item.case_index];
+      if (!sample) continue;
+      const key = `${item.case_index}-${item.repeat_index}`;
+      let group = groups.get(key);
+      if (!group) {
+        group = { caseIndex: item.case_index, repeatIndex: item.repeat_index, case: sample, rows: [] };
+        groups.set(key, group);
+      }
+      group.rows.push(item);
+    }
+    return [...groups.values()].sort((a, b) =>
+      a.caseIndex - b.caseIndex || a.repeatIndex - b.repeatIndex,
+    );
+  }, [detail]);
+  const filteredCaseGroups = useMemo(() => {
+    if (filter === "all") return caseGroups;
+    const reviewed = new Set(detail?.reviews.map((review) => review.item_id) ?? []);
+    return caseGroups.filter(({ rows }) => {
+      if (filter === "not-passed") {
+        return rows.some((item) => item.result?.evaluation.passed === false);
+      }
+      if (filter === "failed") {
+        return rows.some((item) => item.status === "failed");
+      }
+      return rows.some((item) =>
+        item.result?.evaluation.passed === null && !reviewed.has(item.id),
+      );
+    });
+  }, [caseGroups, detail?.reviews, filter]);
+  const resultPageCount = Math.max(1, Math.ceil(filteredCaseGroups.length / RESULT_PAGE_SIZE));
+  const visibleResultPage = Math.min(resultPage, resultPageCount);
+  const visibleCaseGroups = filteredCaseGroups.slice(
+    (visibleResultPage - 1) * RESULT_PAGE_SIZE,
+    visibleResultPage * RESULT_PAGE_SIZE,
+  );
   const titles: Record<string, string> = {
     overview: "評估總覽",
     runs: "測試紀錄",
@@ -232,6 +278,7 @@ export default function App() {
               <th>狀態</th>
               <th>模型</th>
               <th>通過率</th>
+              <th>已回報費用</th>
               <th>建立時間</th>
               <th />
             </tr>
@@ -262,6 +309,16 @@ export default function App() {
                   <strong>
                     {r.pass_rate === null ? "—" : r.pass_rate + "%"}
                   </strong>
+                </td>
+                <td className="run-cost-cell">
+                  <strong>{r.models.every((model) => model.provider === "demo")
+                    ? "示範"
+                    : r.cost_summary?.reported_items
+                      ? `$${r.cost_summary.reported_usd}`
+                      : "尚無"}</strong>
+                  {(r.cost_summary?.unknown_items ?? 0) > 0 && (
+                    <small>{r.cost_summary.unknown_items} 題費用未明</small>
+                  )}
                 </td>
                 <td className="muted">{formatTime(r.created_at)}</td>
                 <td>
@@ -367,6 +424,7 @@ export default function App() {
               {diagnostics.timeout_kind && <><dt>逾時階段</dt><dd>{diagnostics.timeout_kind}</dd></>}
               {diagnostics.configured_timeout_seconds != null && <><dt>網路等待設定</dt><dd>{diagnostics.configured_timeout_seconds} 秒</dd></>}
               {diagnostics.elapsed_ms != null && <><dt>整體耗時</dt><dd>{(diagnostics.elapsed_ms / 1000).toFixed(1)} 秒</dd></>}
+              {diagnostics.reported_cost_usd != null && <><dt>上游已回報費用</dt><dd>${diagnostics.reported_cost_usd}</dd></>}
             </dl>
           </details>
         )}
@@ -383,7 +441,7 @@ export default function App() {
                 <span>示範資料</span>
               ) : (
                 <span>
-                  費用 {result.cost == null ? "未知" : "$" + result.cost}
+                  費用 {result.cost == null ? "未知" : "已回報 $" + result.cost}
                 </span>
               )}
             </div>
@@ -496,11 +554,6 @@ export default function App() {
             <i className={online ? "connected" : ""} />
             {online ? "後端已連線" : "等待後端連線"}
           </div>
-          <p>
-            Build confidence.
-            <br />
-            One evaluation at a time.
-          </p>
           <small>ModelBenchLab / 2026</small>
         </div>
       </aside>
@@ -508,13 +561,6 @@ export default function App() {
         <header className="topbar">
           <div>
             工作台 <ChevronRight size={14} /> <span>{titles[page]}</span>
-          </div>
-          <div className="top-right">
-            <span className="local-tag">
-              <Terminal size={13} />
-              本機工作區
-            </span>
-            <span className="avatar light">M</span>
           </div>
         </header>
         <div className="content">
@@ -589,55 +635,7 @@ export default function App() {
           </div>
           {page === "overview" && (
             <>
-              <div className="hero">
-                <div>
-                  <span className="hero-label">
-                    <Sparkles size={14} /> YOUR NEXT EXPERIMENT
-                  </span>
-                  <h2>
-                    同一道題，
-                    <br />
-                    看見模型之間的差異。
-                  </h2>
-                  <p>
-                    從回答品質到回應速度，
-                    <br />
-                    在同一個工作台完成測試、評分與比較。
-                  </p>
-                  <button onClick={() => newRun()} disabled={!online}>
-                    開始模型比較 <ArrowRight size={17} />
-                  </button>
-                </div>
-                <div className="hero-art" aria-hidden="true">
-                  <div className="orbit" />
-                  <div className="art-card first">
-                    <span>
-                      <i />
-                      MODEL A
-                    </span>
-                    <div className="art-bar long" />
-                    <div className="art-bar" />
-                    <strong>
-                      精確回應 <Check size={17} />
-                    </strong>
-                  </div>
-                  <div className="art-card second">
-                    <span>
-                      <i />
-                      MODEL B
-                    </span>
-                    <div className="art-bar long" />
-                    <div className="art-bar" />
-                    <strong>
-                      多維度評估 <Activity size={17} />
-                    </strong>
-                  </div>
-                  <span className="art-caption">
-                    COMPARE. MEASURE. IMPROVE.
-                  </span>
-                </div>
-              </div>
-              <div className="stats">
+              <div className="stats overview-stats">
                 <div>
                   <span>
                     已連接模型
@@ -688,7 +686,6 @@ export default function App() {
               </div>
               <RankingChart
                 runs={runs}
-                onOpenRun={openRun}
                 onNewRun={() => newRun()}
               />
             </>
@@ -799,19 +796,34 @@ export default function App() {
                   重新整理
                 </button>
                 {active(detail.status) ? (
-                  <button
-                    className="secondary"
-                    disabled={busy}
-                    onClick={() =>
-                      action(async () => {
-                        await api("/runs/" + detail.id + "/cancel", {});
-                        setDetail(await api("/runs/" + detail.id));
-                        await refresh();
-                      })
-                    }
-                  >
-                    取消測試
-                  </button>
+                  <>
+                    {detail.status !== "cancelling" && (
+                      <button
+                        className="secondary"
+                        disabled={busy}
+                        onClick={() =>
+                          action(async () => {
+                            await api("/runs/" + detail.id + "/cancel", {});
+                            setDetail(await api("/runs/" + detail.id));
+                            await refresh();
+                          })
+                        }
+                      >
+                        取消測試
+                      </button>
+                    )}
+                    <button
+                      className="secondary run-delete-button"
+                      disabled={busy}
+                      onClick={() => {
+                        setForceCancellingRun(detail);
+                        setError("");
+                        setModal("force-cancel");
+                      }}
+                    >
+                      強制取消
+                    </button>
+                  </>
                 ) : (
                   !!detail.counts.failed && (
                     <button
@@ -870,6 +882,24 @@ export default function App() {
                   }}
                 />
               </div>
+              {detail.models.some((model) => model.provider !== "demo") && (
+                <div className="run-cost-panel panel" aria-label="測試費用">
+                  <div>
+                    <span>目前已回報費用</span>
+                    <strong>{detail.cost_summary?.reported_items
+                      ? `$${detail.cost_summary.reported_usd}`
+                      : "尚無"}</strong>
+                    <small>{detail.cost_summary?.reported_items ?? 0} 題已回報實際費用</small>
+                  </div>
+                  <p>
+                    每完成一題即更新。OpenRouter 使用回應中的實際費用；
+                    {detail.cost_summary?.unknown_items
+                      ? `${detail.cost_summary.unknown_items} 題費用未明，包含未回報或失敗的請求。`
+                      : "目前沒有費用未明的已結束請求。"}
+                    此金額不含尚在執行中的請求。
+                  </p>
+                </div>
+              )}
               <div className="stats result-stats">
                 {detail.models.map((m) => {
                   const items = detail.items.filter((i) => i.model_id === m.id);
@@ -896,97 +926,124 @@ export default function App() {
                         {p.length}/{g.length} 規則通過 ·{" "}
                         {latency === null ? "—" : latency + " ms"} 平均延遲
                       </small>
+                      {m.provider !== "demo" && (
+                        <small>
+                          已回報費用 {detail.cost_summary?.by_model[m.id]?.reported_items
+                            ? `$${detail.cost_summary.by_model[m.id].reported_usd}`
+                            : "尚無"}
+                          {detail.cost_summary?.by_model[m.id]?.unknown_items
+                            ? ` · ${detail.cost_summary.by_model[m.id].unknown_items} 題費用未明`
+                            : ""}
+                        </small>
+                      )}
                     </div>
                   );
                 })}
               </div>
-              <div className="section-head">
+              <div className="section-head" id="case-results">
                 <h2>
                   逐題比較 <span>SIDE BY SIDE</span>
                 </h2>
                 <select
                   aria-label="篩選結果"
                   value={filter}
-                  onChange={(e) => setFilter(e.target.value)}
+                  onChange={(e) => {
+                    setFilter(e.target.value);
+                    setResultPage(1);
+                    setExpandedCase(null);
+                  }}
                 >
                   <option value="all">全部結果</option>
-                  <option value="failed">未通過 / 執行失敗</option>
+                  <option value="not-passed">未通過</option>
+                  <option value="failed">執行失敗</option>
                   <option value="manual">待人工評分</option>
                 </select>
               </div>
-              {detail.snapshot.cases.map((c, idx) =>
-                Array.from(
-                  { length: detail.snapshot.settings.repeats },
-                  (_, repeat) => {
-                    const rows = detail.items.filter(
-                      (i) => i.case_index === idx && i.repeat_index === repeat,
-                    );
-                    if (!rows.length) return null;
-                    if (
-                      filter === "failed" &&
-                      !rows.some(
-                        (i) =>
-                          i.status === "failed" ||
-                          i.result?.evaluation.passed === false,
-                      )
-                    )
-                      return null;
-                    if (
-                      filter === "manual" &&
-                      !rows.some(
-                        (i) =>
-                          i.result &&
-                          i.result.evaluation.passed === null &&
-                          !detail.reviews.some((r) => r.item_id === i.id),
-                      )
-                    )
-                      return null;
-                    return (
-                      <section
-                        className="case-result panel"
-                        key={idx + "-" + repeat}
-                      >
-                        <div className="case-heading">
-                          <span className="case-number">
-                            {String(idx + 1).padStart(2, "0")}
-                          </span>
-                          <div>
-                            <h3>
-                              {c.title}
-                              {detail.snapshot.settings.repeats > 1
-                                ? " · 第 " + (repeat + 1) + " 次"
-                                : ""}
-                            </h3>
-                            <p>{c.messages.at(-1)?.content}</p>
-                          </div>
-                          <span className="pill neutral">{c.rule.kind}</span>
-                        </div>
-                        {c.messages.length > 1 && (
+              <p className="result-list-meta" aria-live="polite">
+                {filteredCaseGroups.length
+                  ? `共 ${filteredCaseGroups.length} 題，顯示第 ${(visibleResultPage - 1) * RESULT_PAGE_SIZE + 1}–${Math.min(visibleResultPage * RESULT_PAGE_SIZE, filteredCaseGroups.length)} 題；點選題目查看回答。`
+                  : "沒有符合條件的題目。"}
+              </p>
+              {visibleCaseGroups.map(({ caseIndex, repeatIndex, case: sample, rows }) => {
+                const key = `${caseIndex}-${repeatIndex}`;
+                const expanded = expandedCase === key;
+                const prompt = sample.messages.at(-1)?.content ?? "";
+                const executionFailed = rows.some((item) => item.status === "failed");
+                const notPassed = rows.some((item) => item.result?.evaluation.passed === false);
+                const pending = rows.some((item) => active(item.status));
+                const cancelled = rows.every((item) => item.status === "cancelled");
+                const passed = rows.every((item) => item.result?.evaluation.passed === true);
+                const statusText = executionFailed && notPassed
+                  ? "未通過／執行失敗"
+                  : executionFailed
+                    ? "執行失敗"
+                    : notPassed
+                      ? "未通過"
+                      : pending ? "執行中" : cancelled ? "已取消" : passed ? "通過" : "已回答／待評";
+                return (
+                  <section className="case-result panel" key={key}>
+                    <button
+                      type="button"
+                      className="case-heading case-toggle"
+                      aria-expanded={expanded}
+                      onClick={() => setExpandedCase(expanded ? null : key)}
+                    >
+                      <span className="case-number">{String(caseIndex + 1).padStart(2, "0")}</span>
+                      <div>
+                        <h3>
+                          {sample.title}
+                          {detail.snapshot.settings.repeats > 1
+                            ? " · 第 " + (repeatIndex + 1) + " 次"
+                            : ""}
+                        </h3>
+                        <p>{expanded || prompt.length <= 180 ? prompt : `${prompt.slice(0, 180)}…`}</p>
+                      </div>
+                      <span className={"pill " + (executionFailed || notPassed ? "bad" : passed ? "good" : "neutral")}>{statusText}</span>
+                      <ChevronRight className={expanded ? "case-chevron expanded" : "case-chevron"} size={16} />
+                    </button>
+                    {expanded && (
+                      <>
+                        {sample.messages.length > 1 && (
                           <details>
                             <summary>完整對話</summary>
-                            <pre>{JSON.stringify(c.messages, null, 2)}</pre>
+                            <pre>{JSON.stringify(sample.messages, null, 2)}</pre>
                           </details>
                         )}
                         <div
                           className="answers"
-                          style={{
-                            gridTemplateColumns:
-                              "repeat(" +
-                              Math.min(2, detail.models.length) +
-                              ", minmax(0, 1fr))",
-                          }}
+                          style={{ gridTemplateColumns: `repeat(${Math.min(2, detail.models.length)}, minmax(0, 1fr))` }}
                         >
-                          {detail.models.map((m) =>
-                            answerCard(
-                              rows.find((i) => i.model_id === m.id),
-                              m,
-                            ),
+                          {detail.models.map((model) =>
+                            answerCard(rows.find((item) => item.model_id === model.id), model),
                           )}
                         </div>
-                      </section>
-                    );
-                  },
-                ),
+                      </>
+                    )}
+                  </section>
+                );
+              })}
+              {resultPageCount > 1 && (
+                <nav className="result-pagination" aria-label="結果分頁">
+                  <button className="secondary" disabled={visibleResultPage === 1} onClick={() => {
+                    setResultPage(visibleResultPage - 1);
+                    setExpandedCase(null);
+                    document.getElementById("case-results")?.scrollIntoView();
+                  }}>上一頁</button>
+                  <select aria-label="選擇結果頁" value={visibleResultPage} onChange={(event) => {
+                    setResultPage(Number(event.target.value));
+                    setExpandedCase(null);
+                    document.getElementById("case-results")?.scrollIntoView();
+                  }}>
+                    {Array.from({ length: resultPageCount }, (_, index) => (
+                      <option key={index + 1} value={index + 1}>第 {index + 1} / {resultPageCount} 頁</option>
+                    ))}
+                  </select>
+                  <button className="secondary" disabled={visibleResultPage === resultPageCount} onClick={() => {
+                    setResultPage(visibleResultPage + 1);
+                    setExpandedCase(null);
+                    document.getElementById("case-results")?.scrollIntoView();
+                  }}>下一頁</button>
+                </nav>
               )}
             </>
           )}
@@ -1020,6 +1077,7 @@ export default function App() {
                         dataset: "建立題庫版本",
                         "delete-dataset": "刪除測試題庫",
                         "delete-run": "刪除測試紀錄",
+                        "force-cancel": "強制取消測試",
                         import: "匯入題庫",
                         prompt: "建立 Prompt 版本",
                         review: "人工評分",
@@ -1037,6 +1095,28 @@ export default function App() {
               </button>
             </div>
             {error && <div className="alert error">{error}</div>}
+            {modal === "force-cancel" && forceCancellingRun && (
+              <div className="run-delete-confirm">
+                <p>確定要立即結束「{forceCancellingRun.name}」嗎？</p>
+                <p>
+                  {forceCancellingRun.batch_id && "同一批次的所有分段會一起取消。"}
+                  排隊及執行中的題目會立即標為取消，晚到的回答不會儲存。已送出的請求仍可能在廠商端執行並計費，費用也可能無法取得。
+                </p>
+                <div className="dataset-delete-actions">
+                  <button type="button" className="secondary" disabled={busy} onClick={() => setModal(null)}>返回</button>
+                  <button type="button" className="primary dataset-danger-fill" disabled={busy} onClick={() => action(async () => {
+                    await api(`/runs/${forceCancellingRun.id}/force-cancel`, {});
+                    setModal(null);
+                    setForceCancellingRun(null);
+                    setDetail(await api<Detail>(`/runs/${forceCancellingRun.id}`));
+                    await refresh();
+                    setNotice("測試已強制取消，晚到的回答不會覆寫結果");
+                  })}>
+                    {busy ? "取消中…" : "確認強制取消"}
+                  </button>
+                </div>
+              </div>
+            )}
             {modal === "delete-run" && deletingRun && (
               <div className="run-delete-confirm">
                 <p>確定要刪除「{deletingRun.name}」嗎？</p>
@@ -1255,7 +1335,7 @@ export default function App() {
                         })
                       }
                     />
-                    <small>留空時使用各模型的輸出上限（新模型預設 32,768）；填寫後套用至本次所有模型。上限含可能的推理 token，實際費用依用量計。</small>
+                    <small>留空時使用各模型的輸出上限（新模型預設 128,000）；填寫後套用至本次所有模型。上限含可能的推理 token，實際費用依用量計。</small>
                     {noTokenLimitModels.length > 0 && (
                       <small>這些模型未宣告支援 max_tokens，請求會略過此上限：{noTokenLimitModels.map((model) => model.name).join("、")}</small>
                     )}

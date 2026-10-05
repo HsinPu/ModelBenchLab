@@ -1,4 +1,7 @@
+import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
+import httpx
 from sqlalchemy import select
 from app.db import Session, Item, Model, Run
 from app.execution import execute_item, recover_stale
@@ -125,6 +128,97 @@ def test_cancel_during_inflight_preserves_answer(client,monkeypatch):
     data=client.get('/api/runs/'+rid).json()
     assert data['status']=='cancelled'
     assert data['items'][0]['result']['output']=='4'
+
+def test_force_cancel_queued_items_finishes_immediately(client):
+    rid = setup_run(client)
+    response = client.post(f'/api/runs/{rid}/force-cancel')
+    assert response.status_code == 200
+    assert response.json()['cancelled_items'] == 2
+    execute_all(rid)
+    data = client.get(f'/api/runs/{rid}').json()
+    assert data['status'] == 'cancelled'
+    assert data['counts'] == {'cancelled': 2}
+    assert data['finished_at'] is not None
+
+
+def test_force_cancel_discards_late_answer_and_skips_next_request(client, monkeypatch):
+    rid = setup_run(client)
+    calls = []
+
+    def inflight(*_):
+        calls.append(1)
+        response = client.post(f'/api/runs/{rid}/force-cancel')
+        assert response.status_code == 200
+        assert response.json()['cancelled_items'] == 2
+        assert client.get(f'/api/runs/{rid}').json()['status'] == 'cancelled'
+        return {'output': 'late answer', 'latency_ms': 1, 'demo': False}
+
+    monkeypatch.setattr('app.execution.generate', inflight)
+    execute_all(rid)
+    data = client.get(f'/api/runs/{rid}').json()
+    assert calls == [1]
+    assert data['status'] == 'cancelled'
+    assert data['counts'] == {'cancelled': 2}
+    assert all(item['result'] is None for item in data['items'])
+
+
+def test_force_cancel_stops_all_segments_of_batch(client):
+    first = setup_run(client, models=1)
+    second = setup_run(client, models=1)
+    with Session() as db:
+        db.get(Run, first).batch_id = 'one-batch'
+        db.get(Run, second).batch_id = 'one-batch'
+        db.commit()
+    response = client.post(f'/api/runs/{first}/force-cancel')
+    assert response.status_code == 200
+    assert response.json()['runs'] == 2
+    assert response.json()['cancelled_items'] == 2
+    for rid in (first, second):
+        assert client.get(f'/api/runs/{rid}').json()['status'] == 'cancelled'
+
+
+def test_force_cancel_interrupts_worker_http_wait(client, monkeypatch):
+    rid = setup_run(client, models=1)
+    started = threading.Event()
+    interrupted = threading.Event()
+    real_async_client = httpx.AsyncClient
+
+    async def handle(_):
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            interrupted.set()
+            raise
+        return httpx.Response(200, json={'choices': [{'message': {'content': 'late'}}]})
+
+    transport = httpx.MockTransport(handle)
+    monkeypatch.setattr(
+        'app.providers.httpx.AsyncClient',
+        lambda **kwargs: real_async_client(transport=transport, **kwargs),
+    )
+    from app.providers import generate as provider_generate
+
+    def real_request(config, messages, settings, key):
+        return provider_generate(
+            {**config, 'provider': 'openai-compatible', 'endpoint': 'https://model.example/v1'},
+            messages, settings, key,
+        )
+
+    monkeypatch.setattr('app.execution.generate', real_request)
+    with Session() as db:
+        item_id = db.scalar(select(Item.id).where(Item.run_id == rid))
+    worker = threading.Thread(target=execute_item, args=(item_id,), daemon=True)
+    worker.start()
+    assert started.wait(5)
+    assert client.post(f'/api/runs/{rid}/force-cancel').status_code == 200
+    worker.join(5)
+    assert not worker.is_alive()
+    assert interrupted.is_set()
+    data = client.get(f'/api/runs/{rid}').json()
+    assert data['status'] == 'cancelled'
+    assert data['items'][0]['result'] is None
+
 
 def test_terminal_sse_and_csv_injection(client):
     rid=setup_run(client,models=1)

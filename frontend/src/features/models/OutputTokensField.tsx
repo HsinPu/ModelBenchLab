@@ -1,4 +1,4 @@
-export const DEFAULT_OUTPUT_TOKENS = 32768;
+export const DEFAULT_OUTPUT_TOKENS = 128000;
 export const MAX_OUTPUT_TOKENS = 131072;
 
 export function validOutputTokens(value: string) {

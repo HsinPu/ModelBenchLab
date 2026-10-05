@@ -102,6 +102,16 @@ export type Dataset = {
   bundle_total?: number | null;
 };
 export type Prompt = { id: string; name: string; text: string };
+export type CostSummary = {
+  reported_usd: string;
+  reported_items: number;
+  unknown_items: number;
+  by_model: Record<string, {
+    reported_usd: string;
+    reported_items: number;
+    unknown_items: number;
+  }>;
+};
 export type Run = {
   id: string;
   batch_id?: string | null;
@@ -114,6 +124,7 @@ export type Run = {
   graded: number;
   pass_rate: number | null;
   avg_latency_ms: number | null;
+  cost_summary: CostSummary;
   models: Model[];
   dataset_name: string;
 };
@@ -139,6 +150,16 @@ export type Ranking = {
     pass_rate: number | null;
   }[];
 };
+export type DatasetRanking = {
+  dataset_name: string;
+  question_count: number;
+  is_final: boolean;
+  models: (Ranking["models"][number] & {
+    provisional: boolean;
+    cancelled_run: boolean;
+    ranked: boolean;
+  })[];
+};
 export type Item = {
   id: string;
   model_id: string;
@@ -159,6 +180,7 @@ export type Item = {
       elapsed_ms?: number;
       timeout_kind?: string;
       configured_timeout_seconds?: number;
+      reported_cost_usd?: string | null;
     };
   }[];
   result: null | {
@@ -172,6 +194,7 @@ export type Item = {
     upstream_provider?: string | null;
     generation_id?: string | null;
     cost?: string | null;
+    cost_source?: string | null;
     credential_version?: number | null;
     evaluation: { passed: boolean | null; reason: string; error?: boolean };
   };

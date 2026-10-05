@@ -656,7 +656,7 @@ export default function AddModelFlow({
                   />
                   <OutputTokensField value={outputTokens} onChange={setOutputTokens} disabled={busy} />
                   <p className="mm-form-help">
-                    預設 32,768 tokens，包含可能使用的推理 token；這是上限，不代表每次都會用完。模型或服務商若不支援所選設定，試跑或正式測試會顯示錯誤。
+                    預設 128,000 tokens，可自行調整；上限包含可能使用的推理 token，不代表每次都會用完。若高於模型目錄宣告的上限，請先調低設定。
                   </p>
                   <button className="primary" disabled={busy || !validOutputTokens(outputTokens)}>
                     {busy ? "加入中…" : "加入模型"}
