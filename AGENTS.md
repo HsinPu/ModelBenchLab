@@ -37,8 +37,16 @@
 21. 總覽模型排行榜以最近測試的不可變題庫版本為範圍，合併同題庫各次完整題組測試；分批題庫需核對全部題目並合併，同模型只採最近一次涵蓋整份題庫的測試。人工評分、失敗、取消或尚未回答不得進入規則通過率分母；執行中與已取消測試可顯示部分成績但不列正式名次，Demo 模型要標示模擬。
 22. 空白回應與網路逾時分開記錄；`finish_reason=length` 只表示上游回報長度限制，不應直接斷言推理 Token 用盡。正式測試可保存 allowlist 診斷欄位，但不得保存原始回應、推理文字、金鑰或任意上游 metadata。HTTPX 的等待逾時不得標成整題總耗時硬上限。
 23. 一般取消保留已送出請求的結果；強制取消須立即結束整個測試 batch、停止本機正在等待的 HTTP 請求，且晚到回應或背景收尾不得覆寫已取消的 Run / Item。斷線不能保證廠商停止生成或不計費，介面須如實說明。
+24. Coding 題庫只從固定可信 HF repo 取得資料，不執行載入腳本；測試與參考解答不得送入模型 messages。Run 保存逐題測試雜湊、確切資料版本與評分 runtime 快照。
+25. 候選程式只能在非 root、無網路、唯讀且有限制的 Docker 容器執行，不掛載金鑰、資料庫、專案或 Docker socket；評分器不可用時拒絕新測試，不 fallback 到宿主執行。回答與費用先保存再評分，重新評分及評分中斷恢復不得重新呼叫模型。
+26. 程式答錯、語法／執行錯誤及資源超限屬未通過；模型 API 失敗、評分器失敗與人工待評分開。Coding 排名只合併同一 immutable 題庫、runtime 與 code timeout；每題一次且全部可評分才列正式名次及 pass@1。HF 擴充測試評分不得冒稱與官方 EvalPlus harness／排行榜完全相同。
+
+27. BFCL 僅從固定 Gorilla HF repo 匯入已支援的 V3 Python 單輪類別；參考答案不送入模型 messages 或工具 payload。原生 tools/tool_calls 與文字回答分開解析，沒有文字的有效工具回應不能誤判為空白失敗。不執行任意工具函式；工具別名需可重建且無衝突。
+28. BFCL Run 保存 HF SHA、逐題規格／答案雜湊、固定官方 checker 與 native-tools 模式；重新評分不得再次生成，評分版本不符須明確失敗。排名只合併同題庫、同模式與同評分版本，全部可評分才列正式名次，子集成績不得冒稱官方完整排行榜。
+29. 分批排名範圍依題庫 bundle 決定，不能因參考 Run 缺少 batch_id 而縮小成單批；BFCL Schema 轉換只處理定義節點，保留 enum／const／default／examples 資料值。候選數值比較溢位屬未通過，真正評分器故障仍分開記錄。
 
 ## 開發與驗證
+
 在 repository 根目錄：
 ```powershell
 python -m venv .venv
@@ -207,3 +215,20 @@ cd ../backend
 ## 總覽排名資訊精簡（2026-09-26）
 - 移除排名圖表上方的測試名稱、題庫摘要與「查看結果」，以及單模型提示；只保留排名、無可評分回答時的必要提示與評分範圍說明。歷史測試由「測試紀錄」進入。
 - 前端正式 build 與 5175 畫面檢查通過；圖表仍顯示模型列。未重啟 API / Worker 或修改測試資料。詳見 docs/verification.md。
+
+## HumanEval／HumanEval+ Coding 接入（2026-10-05）
+- 題庫匯入新增兩個 HF Coding 題庫，各 164 題；固定或最新 SHA、可重現抽樣或完整題組、預覽後建立不可變版本。保留測試內容與雜湊，模型只接收題目。
+- 本機 Worker 使用固定 Docker image ID 的隔離 Python 評分器，回答與費用先保存；重新評分不重新生成，評分中斷可明確恢復。程式時間上限預設 10 秒、可設 1–120 秒；第一版每題一次。強制取消中斷容器，晚到評分不覆寫取消。
+- Coding 排名只比較同題庫與 runtime／timeout，全部可評分才列正式名次和 pass@1；評分失敗另設篩選。未新增資料表欄位，Coding Run 用 v3 JSON 快照，舊 Run 不變。
+- 99 項後端 pytest（含 11 項真實 Docker 測試）、前端正式 build、Ruff F、pip check、diff check 通過；兩份官方來源各前 10 題參考解答在容器 20/20 通過，5175 瀏覽器匯入預覽驗證完成。未呼叫付費模型或驗證 Compose／官方 EvalPlus 完整 harness；詳見 docs/coding-benchmarks.md 與 docs/verification.md。
+
+## BFCL V3 工具調用接入（2026-10-05）
+- 新增固定 Gorilla HF 來源的五類 Python 單輪題庫，共 1240 題；可複選類別、每類固定抽樣或完整題組、預覽後匯入，完整題組以 1000+240 分批。
+- 原生 tools/tool_calls 與文字回應分開解析，使用固定官方 Python AST 比較規則，不執行工具函式；逐題檢視及分類成績已接入，Run v4 保存來源 SHA、內容雜湊與 checker／adapter runtime。
+- 匯入由後端重建並核對預覽雜湊，保留浮點與大整數，不從瀏覽器回傳標準答案；重新評分不呼叫模型，API／評分失敗與答錯分開。
+- 120 項完整後端回歸（含 11 項 Docker）及 BFCL 21 項複驗通過；官方完整題組參考調用 1240/1240 通過；前端正式 build、Ruff F、pip check、diff check 與本機瀏覽器匯入驗證完成。沒有真實 BFCL 付費推論；完整回歸及限制見 docs/verification.md 與 docs/bfcl-benchmarks.md。
+
+## BFCL 與分批排名錯誤修正（2026-10-05）
+- 單批 Run 的題庫排名仍核對整組 bundle；缺題不列正式成績，也不取代既有完整測試。
+- Schema 遞迴限於定義節點，保留資料常值及原始快照；候選超大整數轉浮點溢位記為未通過／numeric_range，真正 checker 故障維持評分失敗。
+- 新增 5 項 BFCL 回歸及部分 Run 參考的排名斷言。完整 125 項 pytest（含 11 項真實 Docker，53.21 秒）、BFCL／排名 30 項、固定來源參考調用 1240/1240、前端正式 build、Ruff F 與 diff check 通過；未發出真實付費推論，既有快照與結果不重寫。

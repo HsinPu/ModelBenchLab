@@ -91,6 +91,7 @@ export default function App() {
     temperature: 0,
     max_tokens: null as number | null,
     timeout: 600,
+    code_timeout: 10,
   });
   const [batchConfirmed, setBatchConfirmed] = useState(false);
   useEffect(() => setBatchConfirmed(false), [runForm.dataset_id, runForm.model_ids, runForm.repeats, runForm.max_tokens]);
@@ -173,6 +174,7 @@ export default function App() {
       temperature: 0,
       max_tokens: null,
       timeout: 600,
+      code_timeout: 10,
     });
     setModal("run");
   }
@@ -247,8 +249,9 @@ export default function App() {
       if (filter === "failed") {
         return rows.some((item) => item.status === "failed");
       }
+      if (filter === "evaluation-error") return rows.some(item => item.status === "completed" && item.result?.evaluation.error);
       return rows.some((item) =>
-        item.result?.evaluation.passed === null && !reviewed.has(item.id),
+        item.status === "completed" && item.result?.evaluation.passed === null && !item.result.evaluation.error && !item.result.evaluation.pending && !reviewed.has(item.id),
       );
     });
   }, [caseGroups, detail?.reviews, filter]);
@@ -387,13 +390,13 @@ export default function App() {
                     : "neutral")
               }
             >
-              {ev?.passed === true
+              {item.status === "cancelled" ? "已取消" : ev?.passed === true
                 ? "通過"
                 : ev?.passed === false
                   ? "未通過"
                   : review
                     ? "人工已評"
-                    : "待評分"}
+                    : ev?.pending ? "正在評分" : ev?.error ? "評分失敗" : "待評分"}
             </span>
           ) : (
             <Badge status={item.status} />
@@ -431,7 +434,8 @@ export default function App() {
         {result && (
           <>
             <div className="answer-meta">
-              <span>{result.latency_ms} ms</span>
+              <span>生成 {result.latency_ms} ms</span>
+              {ev?.latency_ms != null && <span>程式評分 {(ev.latency_ms / 1000).toFixed(1)} 秒</span>}
               <span>
                 {result.output_tokens === null
                   ? "Token 未提供"
@@ -463,10 +467,20 @@ export default function App() {
               </details>
             )}
             <div className="reason">
-              {review && ev?.passed === null
+              {item.status === "cancelled" && ev?.pending ? "評分已取消；已保存的回答與費用保留" : review && ev?.passed === null
                 ? "已記錄人工評分；不納入自動通過率"
                 : ev?.reason}
             </div>
+            {ev?.kind === "code" && <details className="result-trace">
+              <summary>程式評分資訊與實際執行程式</summary>
+              <dl><dt>結果類型</dt><dd>{ev.outcome || "等待評分"}</dd><dt>測試版本</dt><dd>{ev.tests_sha256 || "尚未執行"}</dd><dt>Python</dt><dd>{ev.runtime?.python || "未提供"}</dd><dt>評分器</dt><dd>{ev.runtime?.runner_version || "未提供"}</dd></dl>
+              {ev.generated_code && <pre>{ev.generated_code}</pre>}
+            </details>}
+            {ev?.kind === "tool_call" && <details className="result-trace">
+              <summary>工具調用評分資訊</summary>
+              <dl><dt>類別</dt><dd>{ev.category}</dd><dt>評分版本</dt><dd>{ev.version}</dd><dt>錯誤類型</dt><dd>{ev.error_type || "無"}</dd></dl>
+              <pre>{JSON.stringify(ev.calls || result?.tool_calls || [], null, 2)}</pre>
+            </details>}
             <div className="review-line">
               <button
                 className="text-button"
@@ -479,7 +493,7 @@ export default function App() {
               >
                 {review ? "人工評分 " + review.score + "/5" : "＋ 人工評分"}
               </button>
-              {ev?.error && (
+              {(ev?.error || ev?.kind === "code" || ev?.kind === "tool_call") && item.status === "completed" && !ev?.pending && detail && ["completed", "completed_with_errors"].includes(detail.status) && (
                 <button
                   className="text-button"
                   onClick={() =>
@@ -489,7 +503,7 @@ export default function App() {
                     })
                   }
                 >
-                  重新評分
+                  重新評分（不重新生成）
                 </button>
               )}
             </div>
@@ -714,7 +728,7 @@ export default function App() {
                   <h3>{d.bundle_name || d.name}</h3>
                   <p>
                     {d.bundle_id
-                      ? `全科題庫 · ${d.bundle_total} 批 · 建立測試時一次送出`
+                      ? `分批題庫 · ${d.bundle_total} 批 · 建立測試時一次送出`
                       : <>{d.cases.slice(0, 3).map((c) => c.title).join(" · ")}{d.cases.length > 3 ? "…" : ""}</>}
                   </p>
                   <div className="card-footer">
@@ -722,9 +736,9 @@ export default function App() {
                     <div className="dataset-card-actions">
                       <button
                         className="text-button"
-                        onClick={() => d.bundle_id ? newRun(`bundle:${d.bundle_id}`) : newDataset(d)}
+                        onClick={() => d.bundle_id ? newRun(`bundle:${d.bundle_id}`) : (d.coding || d.tool_call) ? newRun(d.id) : newDataset(d)}
                       >
-                        {d.bundle_id ? "建立整批測試" : "檢視 / 複製編輯"} <ArrowRight size={14} />
+                        {d.bundle_id ? "建立整批測試" : d.tool_call ? "建立工具調用測試" : d.coding ? "建立程式測試" : "檢視 / 複製編輯"} <ArrowRight size={14} />
                       </button>
                       <button
                         className="text-button dataset-delete-button"
@@ -956,6 +970,7 @@ export default function App() {
                   <option value="all">全部結果</option>
                   <option value="not-passed">未通過</option>
                   <option value="failed">執行失敗</option>
+                  <option value="evaluation-error">評分失敗</option>
                   <option value="manual">待人工評分</option>
                 </select>
               </div>
@@ -970,6 +985,7 @@ export default function App() {
                 const prompt = sample.messages.at(-1)?.content ?? "";
                 const executionFailed = rows.some((item) => item.status === "failed");
                 const notPassed = rows.some((item) => item.result?.evaluation.passed === false);
+                const evaluationError = rows.some(item => item.status === "completed" && item.result?.evaluation.error);
                 const pending = rows.some((item) => active(item.status));
                 const cancelled = rows.every((item) => item.status === "cancelled");
                 const passed = rows.every((item) => item.result?.evaluation.passed === true);
@@ -979,7 +995,7 @@ export default function App() {
                     ? "執行失敗"
                     : notPassed
                       ? "未通過"
-                      : pending ? "執行中" : cancelled ? "已取消" : passed ? "通過" : "已回答／待評";
+                      : pending ? (rows.some(item => item.result?.evaluation.pending) ? "程式評分中" : "執行中") : cancelled ? "已取消" : evaluationError ? "評分失敗" : passed ? "通過" : "已回答／待評";
                 return (
                   <section className="case-result panel" key={key}>
                     <button
@@ -1101,6 +1117,7 @@ export default function App() {
                 <p>
                   {forceCancellingRun.batch_id && "同一批次的所有分段會一起取消。"}
                   排隊及執行中的題目會立即標為取消，晚到的回答不會儲存。已送出的請求仍可能在廠商端執行並計費，費用也可能無法取得。
+                  本機正在執行的程式評分容器也會停止；已保存的模型回答與費用保留。
                 </p>
                 <div className="dataset-delete-actions">
                   <button type="button" className="secondary" disabled={busy} onClick={() => setModal(null)}>返回</button>
@@ -1362,6 +1379,10 @@ export default function App() {
                       }
                     />
                     <small>這是單次連線或讀寫等待的上限，不是整題總耗時上限；總耗時可能超過此值。</small>
+                  </label>
+                  <label>程式執行時間上限（秒）
+                    <input type="number" min="1" max="120" required value={runForm.code_timeout} onChange={e => setRunForm({ ...runForm, code_timeout: Number(e.target.value) })} />
+                    <small>僅用於 HumanEval／HumanEval+；每題生成一次，使用隔離 Python 評分器。此值與網路等待分開。</small>
                   </label>
                 </div>
                 <div className="estimate">

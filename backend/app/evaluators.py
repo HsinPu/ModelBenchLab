@@ -2,8 +2,11 @@ import json
 import re
 from jsonschema import validate, ValidationError
 
-def evaluate(text, rule):
+def evaluate(text, rule, settings=None, cancelled=lambda: False):
     kind = rule['kind']
+    if kind == 'code':
+        from .coding import evaluate_code
+        return evaluate_code(text, rule['coding'], settings or {}, cancelled)
     if kind == 'manual':
         return {'version': '1', 'kind': kind, 'passed': None, 'reason': '待人工評分'}
     if kind == 'exact':

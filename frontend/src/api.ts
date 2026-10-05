@@ -14,7 +14,8 @@ export type Model = {
   max_output_tokens: number;
   catalog?: CatalogDetails | null;
 };
-export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type ReasoningEffort =
+  "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type CatalogDetails = {
   context_length: number | null;
   max_completion_tokens: number | null;
@@ -71,7 +72,19 @@ export type CatalogPage = {
   error: string;
 };
 export type Rule = {
-  kind: "manual" | "exact" | "contains" | "choice" | "json_schema";
+  kind: "manual" | "exact" | "contains" | "choice" | "json_schema" | "code" | "tool_call";
+  bfcl?: { category: string; task_id: string; functions: Record<string, unknown>[]; answers?: unknown[]; dataset_repo: string; dataset_revision: string; data_sha256: string };
+  coding?: {
+    benchmark: string;
+    task_id: string;
+    entry_point: string;
+    prompt: string;
+    tests: string;
+    tests_sha256: string;
+    dataset_repo: string;
+    dataset_revision: string;
+    suite_version: string;
+  };
   expected?: string;
   schema?: Record<string, unknown>;
 };
@@ -83,15 +96,19 @@ export type Case = {
   source?: {
     dataset: string;
     revision: string;
-    subject: string;
+    subject?: string;
     split: string;
-    row: number;
+    row?: number;
     url: string;
     license: string;
-    imported_from: string;
+    imported_from?: string;
+    task_id?: string;
+    seed?: number;
   } | null;
 };
 export type Dataset = {
+  tool_call?: boolean;
+  coding?: boolean;
   id: string;
   name: string;
   cases: Case[];
@@ -106,11 +123,14 @@ export type CostSummary = {
   reported_usd: string;
   reported_items: number;
   unknown_items: number;
-  by_model: Record<string, {
-    reported_usd: string;
-    reported_items: number;
-    unknown_items: number;
-  }>;
+  by_model: Record<
+    string,
+    {
+      reported_usd: string;
+      reported_items: number;
+      unknown_items: number;
+    }
+  >;
 };
 export type Run = {
   id: string;
@@ -158,6 +178,8 @@ export type DatasetRanking = {
     provisional: boolean;
     cancelled_run: boolean;
     ranked: boolean;
+    metric?: string;
+    categories?: Record<string, { graded: number; passed: number }>;
   })[];
 };
 export type Item = {
@@ -184,6 +206,7 @@ export type Item = {
     };
   }[];
   result: null | {
+    tool_calls?: { name: string; arguments: string }[];
     output: string;
     latency_ms: number;
     input_tokens: number | null;
@@ -196,7 +219,22 @@ export type Item = {
     cost?: string | null;
     cost_source?: string | null;
     credential_version?: number | null;
-    evaluation: { passed: boolean | null; reason: string; error?: boolean };
+    evaluation: {
+      passed: boolean | null;
+      reason: string;
+      error?: boolean;
+      pending?: boolean;
+      kind?: string;
+      category?: string;
+      version?: string;
+      error_type?: string;
+      calls?: Record<string, unknown>[];
+      outcome?: string;
+      latency_ms?: number;
+      generated_code?: string;
+      tests_sha256?: string;
+      runtime?: { python: string; image_id: string; runner_version: string };
+    };
   };
 };
 export type Detail = Run & {

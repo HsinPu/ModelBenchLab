@@ -11,6 +11,8 @@ React + TypeScript → FastAPI → SQLAlchemy → SQLite（本機）/ PostgreSQL
 | backend/app/provider_types.py | 可用服務類型、位址規則、金鑰需求、目錄與驗證能力；新增廠商的登錄入口 |
 | backend/app/openrouter.py | OpenRouter metadata GET、目錄正規化、可重試錯誤分類 |
 | backend/app/tmmluplus.py | 固定官方版本與科目白名單、限量下載或本機 CSV 轉換、可重現抽樣 |
+| backend/app/coding_benchmarks.py | HumanEval／HumanEval+ 白名單檔案、固定 SHA、限量資料解析及可重現抽樣 |
+| backend/app/coding.py + coding_runner/ | Docker-only Python 評分、runtime 快照、取消、固定結果碼；無宿主程式執行 fallback |
 | backend/app/providers.py | Demo / OpenAI 相容 / OpenRouter chat completion 與用量解析 |
 | backend/app/execution.py | 工作 claim、取消、重試、實際金鑰版本與結果保存 |
 | backend/app/db.py + migrations | SQLAlchemy 結構、Alembic migration、SQLite 升級前備份 |
@@ -70,6 +72,12 @@ Alembic `0001 → 0002 → 0003 → 0004 → 0005 → 0006 → 0007` 同時支�
 - GET `/api/health`；OpenAPI `/docs`
 
 ## 邊界
+
+BFCL V3 Python 單輪工具調用以原生 tools/tool_calls 執行，固定來源與 Python AST 比較規則；不執行工具函式。Run v4 在既有 JSON 保存 BFCL 規格、SHA 與評分 runtime；回答保存後才評分，重評沿用原回答，同 runtime 才合併排名。詳見 [bfcl-benchmarks.md](bfcl-benchmarks.md)。此成績不是完整官方排行榜或長時間 Agent 測試。
+
+題庫排行榜由 Dataset.bundle_id 決定完整範圍，不依參考 Run 是否帶 batch_id 縮小題組；部分批次不取代完整成績。BFCL adapter 僅轉換 Schema 子節點，保留 enum/default 等資料常值；候選数值在比較過程溢位判為答錯，其他評分器例外維持獨立失敗狀態。
+
+Python Coding 題庫已接入 HumanEval／HumanEval+，由 Docker-only 評分器執行固定版本的 HF 測試；模型生成結果先保存，評分與重新生成分離。Coding Run 使用 v3 JSON 快照，資料表結構未變；同題庫、runtime 與 code timeout 才合併排名。詳見 [coding-benchmarks.md](coding-benchmarks.md)。此功能尚不支援 Compose runtime、跨套件重評或官方 EvalPlus 完整 harness。
 
 本機私人單人使用，支援固定模型與動態路由的非串流文字評估。圖片、音訊、影片輸出與 embedding 尚無對應題型和評分。登入、多租戶、工具實際執行、模型串流、Prompt 變數、服務商鎖定、每廠商限流排程、費用預算控制、跨 Run 回歸比較、LLM Judge 與 MLCommons 整合尚未納入。
 

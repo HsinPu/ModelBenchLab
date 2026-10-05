@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from contextlib import suppress
 import httpx
@@ -76,6 +77,10 @@ def generate(config, messages, settings, key="", client=None):
             catalog.get("supported_parameters") if isinstance(catalog, dict) else None
         )
         payload = {"model": config["model"], "messages": messages, "stream": False}
+        if settings.get('_bfcl'):
+            from .bfcl import tools_for
+            payload['tools'] = tools_for(settings['_bfcl'])
+            payload['tool_choice'] = 'auto'
         if supported is None or "temperature" in supported:
             payload["temperature"] = settings["temperature"]
         if supported is None or "max_tokens" in supported:
@@ -130,6 +135,20 @@ def generate(config, messages, settings, key="", client=None):
             return value[:300] if isinstance(value, str) else None
 
         output = choice["message"].get("content")
+        calls = []
+        if settings.get('_bfcl'):
+            raw_calls = choice['message'].get('tool_calls') or []
+            if not isinstance(raw_calls, list) or len(raw_calls) > 100:
+                raise ValueError('invalid tool calls')
+            for call in raw_calls:
+                function = call['function']
+                if call.get('type') != 'function' or not isinstance(function.get('name'), str) or not isinstance(function.get('arguments'), str):
+                    raise ValueError('invalid function response')
+                if len(function['name']) > 200 or len(function['arguments']) > 200000:
+                    raise ValueError('tool call too large')
+                calls.append({'name': function['name'], 'arguments': function['arguments']})
+            if calls and (output is None or (isinstance(output, str) and not output.strip())):
+                output = json.dumps(calls, ensure_ascii=False, indent=2)
         if output is None or (isinstance(output, str) and not output.strip()):
             token_details = (
                 usage.get("completion_tokens_details")
@@ -172,6 +191,7 @@ def generate(config, messages, settings, key="", client=None):
             )
         return {
             "output": output,
+            **({'tool_calls': calls} if settings.get('_bfcl') else {}),
             "latency_ms": round((time.perf_counter() - start) * 1000),
             "input_tokens": token("prompt_tokens"),
             "output_tokens": token("completion_tokens"),
@@ -204,7 +224,10 @@ def generate(config, messages, settings, key="", client=None):
             code="connection_uncertain",
         )
     except (KeyError, IndexError, ValueError, TypeError, AttributeError):
-        raise ProviderError("模型回應格式不符合 chat/completions 文字格式")
+        raise ProviderError(
+            "模型回應格式不符合 chat/completions 工具格式" if settings.get('_bfcl') else "模型回應格式不符合 chat/completions 文字格式",
+            diagnostics={'reported_cost_usd': reported_charge} if 'reported_charge' in locals() else {},
+        )
     finally:
         if own:
             client.close()

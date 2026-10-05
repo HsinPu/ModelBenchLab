@@ -86,8 +86,10 @@ export default function RankingChart({
                   {model.ranked ? String(index + 1).padStart(2, "0") : "—"}
                 </span>
                 <div className="ranking-model">
+                  {model.metric && <small>{model.metric}{!model.ranked && " · 尚未完整評分"}</small>}
                   <strong>{model.name}{model.provider === "demo" && <em>示範</em>}{model.dynamic_model && <em>動態路由</em>}{model.provisional && <em>執行中 · 暫不排名</em>}{model.cancelled_run && <em>已取消 · 暫不排名</em>}</strong>
                   <small>通過 {model.passed} / 已評分 {model.graded} · 已回答 {model.completed} / {model.total}{model.failed > 0 ? ` · 失敗 ${model.failed}` : ""}{model.cancelled > 0 ? ` · 已取消 ${model.cancelled}` : ""}</small>
+                  {model.metric === "工具調用正確率" && Object.entries(model.categories || {}).map(([category, score]) => <small key={category}>{({ simple: "單一工具", multiple: "多工具選擇", parallel: "多個調用", parallel_multiple: "混合多工具", irrelevance: "不相關工具" } as Record<string, string>)[category]}：{score.passed} / {score.graded}（{(100 * score.passed / score.graded).toFixed(1)}%）</small>)}
                 </div>
                 <div className="ranking-measure">
                   <span className="ranking-value">{model.pass_rate === null ? "未評分" : `${model.pass_rate.toFixed(1)}%`}</span>
@@ -100,6 +102,8 @@ export default function RankingChart({
           </div>
           <div className="ranking-axis" aria-hidden="true"><span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>
           <p className="ranking-note">同一題庫版本的各次測試合併顯示，每個模型只採最近一次涵蓋整份題庫的測試；只計入有規則自動評分的回答，失敗題目另外列出。執行中或已取消的模型不列正式名次。{ranking.models.some((model) => model.dynamic_model) && " 動態路由成績可能由多個實際模型共同產生，逐題模型請至測試結果查看。"}{!ranking.is_final && " 測試完成前分數可能變動。"}</p>
+          {ranking.models.some(model => model.metric === "工具調用正確率") && <p className="ranking-note">BFCL V3 Python 單輪子集：只合併相同工具調用模式與評分版本；全部題目可評分才列正式名次。此成績不代表完整官方排行榜。</p>}
+          {ranking.models.some(model => model.metric && model.metric !== "工具調用正確率") && <p className="ranking-note">程式測試僅合併相同評分映像與執行時間上限；完整題組每題一次且全部可評分才標示 pass@1。這是本工具的隔離測試成績，不能直接視為官方排行榜分數。</p>}
           {error && <p className="ranking-note" role="alert">{error}</p>}
         </div>
       ) : null}

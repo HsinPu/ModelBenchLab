@@ -3,6 +3,8 @@
 繁體中文 LLM 評估工作台：用同一份題庫比較多個模型的回答、品質與延遲。
 
 ## v0.2 功能
+- BFCL V3 Python 單輪工具調用題庫：五類共 1240 題、固定／來源最新 SHA、每類抽樣或完整匯入、原生 tools/tool_calls 與固定官方 Python 比較規則。詳見 [BFCL 操作與範圍](docs/bfcl-benchmarks.md)。
+  分批排名核對整組題庫；工具 Schema 保留資料常值，數值參數溢位計為未通過。
 - OpenRouter 廠商連線、加密 API Key、驗證與輪替、共用金鑰及啟停。
 - 模型目錄同步快取、搜尋 / 能力 / 免費篩選、分頁與批次加入。
 - 模型詳情可刪除模型：從管理清單移除並停用，歷史測試與評分保留；執行中或排隊中的測試會阻止刪除。
@@ -73,6 +75,16 @@ Docker 內連本機模型服務時，Windows/macOS 的端點通常改用 `http:/
 本版無登入功能，只限可信任的本機/私人使用，預設不暴露公網。
 
 ## 匯入格式
+新增 Coding 題庫：[HumanEval](https://huggingface.co/datasets/openai/openai_humaneval) 與 [HumanEval+](https://huggingface.co/datasets/evalplus/humanevalplus)，各 164 題 Python 函式實作。從「測試題庫 → 匯入 → Hugging Face」選擇，可匯入固定抽樣或完整題組，先預覽再儲存。固定版本與每次查詢的官方最新版本皆會保存確切 commit SHA；不執行 Hugging Face 的載入腳本。
+
+程式評分需要本機 Docker Linux 引擎。首次先執行：
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-coding-runner.ps1
+```
+建立測試時可設定獨立的「程式執行時間上限」，預設 10 秒、可設 1–120 秒，每題生成一次。系統先保存模型回答及已回報費用，再於無網路、唯讀、非 root 且有限制的容器執行測試。答錯、語法錯誤及程式超時列為「未通過」；API 失敗與「評分失敗」分開。整場完成後可重新評分，使用原回答及原設定，不重新呼叫模型。
+
+排行榜只合併同題庫、同評分映像與時間上限的成績；每題一次且全部可評分才標示 pass@1。HumanEval+ 採用該固定 HF 版本的擴充測試，尚未整合官方 EvalPlus CLI，因此不能直接宣稱與官方排行榜相同。此功能目前支援本機 Worker；Compose 服務沒有 Docker CLI／daemon 存取，不會自行掛載 Docker socket。詳見 [Coding 題庫與評分](docs/coding-benchmarks.md)。
+
 在「測試題庫 → 匯入題庫」先選來源。選「Hugging Face」後，再選要匯入的題庫；目前支援 [iKala / TMMLU+](https://huggingface.co/datasets/ikala/tmmluplus)，尚未支援任意 Hugging Face 資料集。預設選「官方最新版本」：每次預覽前取得當下的 `main` commit SHA 與驗證／測試集科目清單，再以該 SHA 讀取整次預覽的所有科目；匯入後每題保留確切 SHA 與原始連結。也可選固定 v1.1 重現舊版。TMMLU+ 可選單科或目前版本的全部科目，再選每科固定抽樣或完整驗證／測試分割；先預覽再加入題庫。全科抽樣每科最多 15 題；完整分割若超過 1000 題會自動建立整組分批題庫。固定 v1.1 單科下載失敗時，可從視窗中的官方連結下載 CSV，改由本機原始 CSV 入口預覽；本機檔案內容由使用者提供，系統不驗證它與官方檔案完全相同，因此不能標為最新官方 commit。資料集標示 MIT 授權，重新散布時請保留原授權聲明。
 
 建立測試時可一次選整組分批題庫送出；每個 Run 最多 5000 個工作項目，整組最多 50000 次模型請求。介面會顯示預計請求數，使用者勾選費用提醒並按「開始測試」後才會呼叫模型。完整測試集約 19680 題；訓練集不包含在測試範圍。

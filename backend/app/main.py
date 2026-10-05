@@ -40,6 +40,10 @@ from .costs import summarize_costs
 from .rankings import dataset_ranking
 from .seed import seed
 from .tmmluplus import router as tmmluplus_router
+from .coding_benchmarks import router as coding_benchmarks_router
+from .coding import router as coding_router, run_settings
+from .bfcl_benchmarks import router as bfcl_router
+from .bfcl import run_settings as bfcl_run_settings
 
 
 @asynccontextmanager
@@ -54,6 +58,9 @@ async def lifespan(app):
 app = FastAPI(title="ModelBenchLab API", version="0.2.0", lifespan=lifespan)
 app.include_router(connections_router)
 app.include_router(tmmluplus_router)
+app.include_router(coding_benchmarks_router)
+app.include_router(coding_router)
+app.include_router(bfcl_router)
 
 
 @app.exception_handler(RequestValidationError)
@@ -230,7 +237,9 @@ def datasets():
         return [
             {
                 "id": d.id, "name": d.name,
-                "cases": [] if d.bundle_id else d.cases,
+                "cases": [] if d.bundle_id else display_cases(d.cases),
+                "coding": any(case['rule']['kind'] == 'code' for case in d.cases),
+                "tool_call": any(case['rule']['kind'] == 'tool_call' for case in d.cases),
                 "case_count": len(d.cases),
                 "bundle_id": d.bundle_id, "bundle_name": d.bundle_name,
                 "bundle_index": d.bundle_index, "bundle_total": d.bundle_total,
@@ -241,6 +250,20 @@ def datasets():
                 .order_by(Dataset.created_at.desc())
             )
         ]
+
+
+def display_cases(cases):
+    # Avoid retransmitting large executable suites on every progress refresh.
+    # Import preview and JSON export retain the full immutable test content.
+    result = []
+    for case in cases:
+        rule = case.get('rule', {})
+        if rule.get('kind') == 'code' and rule.get('coding'):
+            case = {**case, 'rule': {**rule, 'coding': {key: value for key, value in rule['coding'].items() if key != 'tests'}}}
+        if rule.get('kind') == 'tool_call' and rule.get('bfcl'):
+            case = {**case, 'rule': {**rule, 'bfcl': {key: value for key, value in rule['bfcl'].items() if key != 'answers'}}}
+        result.append(case)
+    return result
 
 
 @app.post("/api/datasets", status_code=201)
@@ -430,16 +453,18 @@ def create_run(body: RunInput):
         ]
         if len(dataset.cases) * len(selected) * body.repeats > 5000:
             raise HTTPException(422, "單次測試最多 5000 個工作項目")
+        settings = run_settings(dataset.cases, body.model_dump(
+            include={"repeats", "temperature", "max_tokens", "timeout", "code_timeout"}
+        ))
+        settings = bfcl_run_settings(dataset.cases, settings, selected)
         snapshot = {
-            "version": 2,
+            "version": 4 if settings.get('bfcl_runtime') else 3 if settings.get('coding_runtime') else 2,
             "dataset_id": dataset.id,
             "dataset_name": dataset.name,
             "cases": dataset.cases,
             "prompt": {"id": prompt.id, "name": prompt.name, "text": prompt.text},
             "models": selected,
-            "settings": body.model_dump(
-                include={"repeats", "temperature", "max_tokens", "timeout"}
-            ),
+            "settings": settings,
         }
         run = Run(id=str(uuid4()), name=body.name, snapshot=snapshot)
         db.add(run)
@@ -486,6 +511,10 @@ def create_run_batch(body: RunBatchInput):
             for mid in body.model_ids
         ]
         total_cases = sum(len(dataset.cases) for dataset in datasets)
+        settings = run_settings([case for dataset in datasets for case in dataset.cases], body.model_dump(
+            include={"repeats", "temperature", "max_tokens", "timeout", "code_timeout"}
+        ))
+        settings = bfcl_run_settings([case for dataset in datasets for case in dataset.cases], settings, selected)
         total_jobs = total_cases * len(selected) * body.repeats
         if total_jobs > 50000:
             raise HTTPException(422, "整批測試最多 50000 個工作項目，請減少模型或重複次數")
@@ -504,15 +533,13 @@ def create_run_batch(body: RunBatchInput):
                 name=f"{body.name[:95]} · {index}/{len(parts)}",
                 batch_id=batch_id,
                 snapshot={
-                    "version": 2,
+                    "version": 4 if settings.get('bfcl_runtime') else 3 if settings.get('coding_runtime') else 2,
                     "dataset_id": dataset.id,
                     "dataset_name": f"{dataset.bundle_name} · {index}/{len(parts)}",
                     "cases": cases,
                     "prompt": {"id": prompt.id, "name": prompt.name, "text": prompt.text},
                     "models": selected,
-                    "settings": body.model_dump(
-                        include={"repeats", "temperature", "max_tokens", "timeout"}
-                    ),
+                    "settings": settings,
                 },
             )
             db.add(run)
@@ -539,7 +566,7 @@ def create_run_batch(body: RunBatchInput):
 
 
 @app.get("/api/runs/{identifier}")
-def run_detail(identifier: str):
+def run_detail(identifier: str, include_tests: bool = False):
     with Session() as db:
         run = visible_run(db, identifier)
         items = db.scalars(
@@ -555,7 +582,7 @@ def run_detail(identifier: str):
         ).all()
         return {
             **run_summary(db, run),
-            "snapshot": run.snapshot,
+            "snapshot": run.snapshot if include_tests else {**run.snapshot, 'cases': display_cases(run.snapshot['cases'])},
             "items": [item_data(i) for i in items],
             "reviews": [
                 {
@@ -710,9 +737,28 @@ def re_evaluate(identifier: str):
     with Session() as db:
         item = required(db, Item, identifier)
         visible_run(db, item.run_id)
-        if not item.result:
+        if not item.result or item.status != 'completed':
             raise HTTPException(409, "此項目尚無回答")
         run = db.get(Run, item.run_id)
+        rule = run.snapshot['cases'][item.case_index]['rule']
+        if rule['kind'] in ('code', 'tool_call'):
+            if run.status not in ('completed', 'completed_with_errors'):
+                raise HTTPException(409, '請等待整場測試完成後再重新評分')
+            # A fresh conditional claim evaluates saved output without generating again.
+            changed = db.execute(update(Item).where(Item.id == identifier, Item.status == 'completed').values(
+                status='queued', finished_at=None, result={**item.result, 'evaluation': {
+                    'kind': rule['kind'], 'passed': None, 'pending': True, 'reason': '等待重新評分；不重新生成',
+                }},
+            ))
+            if not changed.rowcount:
+                raise HTTPException(409, '此項目正在評分')
+            db.execute(update(Run).where(Run.id == run.id, Run.status == run.status).values(status='queued', finished_at=None))
+            db.commit()
+            try:
+                dispatch([identifier])
+            except Exception:
+                return {'ok': True, 'queued': True, 'dispatch_warning': '佇列暫時無法連線，恢復後將重新派送評分'}
+            return {'ok': True, 'queued': True}
         item.result = {
             **item.result,
             "evaluation": evaluate(
@@ -725,7 +771,7 @@ def re_evaluate(identifier: str):
 
 @app.get("/api/runs/{identifier}/export")
 def export(identifier: str, format: str = "json"):
-    data = run_detail(identifier)
+    data = run_detail(identifier, include_tests=True)
     if format == "json":
         return JSONResponse(
             data,

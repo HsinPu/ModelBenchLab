@@ -161,3 +161,5 @@ def test_dataset_ranking_merges_complete_batches_only(client):
     assert [model["model_id"] for model in ranking["models"]] == ["a", "b"]
     assert [model["total"] for model in ranking["models"]] == [2, 2]
     assert [model["pass_rate"] for model in ranking["models"]] == [100.0, 0.0]
+    # A standalone subset run must resolve the same complete bundle scope.
+    assert client.get("/api/runs/partial/dataset-ranking").json() == ranking

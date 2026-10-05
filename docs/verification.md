@@ -271,3 +271,32 @@
 - 81 項後端 pytest 通過（16.39 秒），前端正式 build、Ruff F 與 `git diff --check` 通過。
 - 首次沙箱執行受暫存 SQLite 目錄及 esbuild 子程序權限限制；改以核准權限重跑後通過，未修改應用程式以繞過問題。
 - 檢查待提交清單沒有 `.env`、`.local-key`、SQLite 資料庫或日誌。此次未進行真實付費模型推論、Docker 或新一輪瀏覽器驗收。
+
+# HumanEval／HumanEval+ 接入
+
+日期：2026-10-05。
+
+- 完整後端回歸包含 opt-in Docker 測試：99 項 pytest 通過（41.27 秒），其中 11 項實際 Linux Docker 測試。覆蓋正確／錯誤程式、執行錯誤、無窮迴圈、提前退出、非 root／無敏感掛載、唯讀檔案、網路隔離、取消、記憶體限制，以及 Worker 保存生成後實際 Docker 評分與不重新生成的重評。全程模型輸出由 fixture 提供，沒有真實廠商金鑰或付費推論。
+- 前端 TypeScript／Vite 正式 build、Ruff F、pip check 與 `git diff --check` 通過。FastAPI TestClient 有既有依賴棄用警告，不影響測試。
+- Docker Linux 26.1.4 實際建立 `modelbench-coding:1`，image ID `sha256:9ad77ced3e670c677e4db6c35a832ecf535a9794e2e9bd186fd8dfdfcd953b07`。Python 基底 digest 與 numpy 2.2.6 固定；驗證後本工具建立的 `modelbench-code-*` 容器均已清理。
+- 兩個固定官方 SHA 各成功解析 164 題。`scripts/verify-coding.py --questions 10` 實際下載並在容器執行各前 10 題參考解答，20/20 通過；尚未逐一執行全部 328 份官方參考解答。
+- 5175 瀏覽器確認 Hugging Face 題庫選擇新增兩個 Coding 入口；HumanEval 固定版本 seed=0 抽 3 題得到 task 10／98／107；HumanEval+ 官方最新完整預覽顯示 164/164、SHA `d32357cf319e`、Apache-2.0，最多顯示 10 題，展開可讀函式規格。沒有將測試或參考解答顯示成模型輸入。
+- 開發服務已確認沒有活動測試後重啟；API `/api/coding/runner` 確認可用。瀏覽器預覽未保存新題庫或對使用者模型開始新測試；不修改既有題庫、結果與金鑰。完整生成／評分／重評流程在隔離測試資料庫驗證。
+- 未驗證 PostgreSQL／Celery 整組 runtime、真實模型 Coding 生成及官方 EvalPlus CLI 等價性。Compose 沒有 Docker CLI／daemon 存取，功能明確拒絕，不自動掛載 socket 或改用宿主執行。
+
+## BFCL V3 Python 單輪工具調用（2026-10-05）
+
+- 固定 HF SHA `61fc0608cfd831fcfbbaa676ebdfef0ed963eeda` 五類全部 1240 題下載／格式驗證成功：400+200+200+200+240。`scripts/verify-bfcl.py` 參考調用 1240/1240 通過，不呼叫模型、不寫入資料庫；省略可选參數並遵守 required 規格，保留原始答案。
+- 全套後端回歸含 11 項實際 Linux Docker 測試；BFCL 新增覆蓋工具選擇、JSON／型別錯誤、亂調用、平行順序與重複調用、別名、目錄能力、原生無文字回應、上游費用欄位解析（MockTransport）、快照與排名、重評不重新生成、強制取消晚到回答及浮點／大整數匯入。最終通過數列於下方。
+- TypeScript／Vite 正式 build、Ruff F、pip check、`git diff --check` 通過。首次沙箱執行遇到暫存 SQLite 存取與 esbuild spawn EPERM，核准權限重跑後通過；既有 TestClient 棄用警告保留。
+- 本機 5175 瀏覽器驗證來源→BFCL→五類固定抽樣（100 題）→完整預覽（1240 題）→匯入。首次實際儲存暴露 JavaScript 浮點序列化的雜湊問題；改為 `/benchmarks/bfcl/import` 後端重建原始資料並核對預覽內容後，完整 1000+240 題成功儲存，卡片顯示 1240 題／2 批／建立整批測試。新評分資料與 UI 使用正式本機服務，沒有新增或中斷付費測試。
+- 未驗證真實廠商 tools 推論、完整官方 leaderboard harness／權重，或多輪／live／V4 Agent 類別。本工具結果是 BFCL V3 Python 單輪子集；標準答案比較不代表工具執行或長時間工作能力。
+
+- 最終完整回歸：120 passed（含 11 項實際 Docker 測試，50.04 秒）；加入 adapter 雜湊後單獨 BFCL 21 passed。沒有使用真實金鑰或發出付費工具調用。
+
+## BFCL 邊界與分批排名修正（2026-10-05）
+
+- 隔離 SQLite 重現的 1001 題 bundle 單批 1000 題測試，修正後排名範圍為 1001，無完整測試時 models 為空；既有完整 bundle 測試可由部分 Run 作參考查詢，結果相同，部分測試不取代完整成績。
+- Schema 測試涵蓋 enum、const、default、examples、擴充資料欄位、名為 type 的參數、$defs、items、allOf 與布林 Schema；資料值及輸入規格不變，只有 Schema 型別轉換。正負 10**400 候選數值均為未通過／numeric_range；一般整數轉浮點仍正確，真正 checker 例外仍為評分失敗。
+- BFCL／排名 30 passed；完整 pytest 125 passed（含 11 項真實 Docker，53.21 秒）。固定 HF 來源參考調用 1240/1240、前端正式 build、Ruff F、git diff --check 通過。保留既有 TestClient 棄用警告。
+- 未呼叫真實付費模型，未修改使用者題庫、歷史 Run 快照或結果。adapter 雜湊隨修正更新，舊 BFCL runtime 不會被新版本悄悄重新評分。

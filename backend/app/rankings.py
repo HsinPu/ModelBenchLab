@@ -27,7 +27,7 @@ def dataset_ranking(db, reference):
 
     datasets = (
         db.scalars(select(Dataset).where(Dataset.bundle_id == dataset.bundle_id)).all()
-        if dataset.bundle_id and reference.batch_id else [dataset]
+        if dataset.bundle_id else [dataset]
     )
     question_count = sum(len(part.cases) for part in datasets)
     dataset_ids = {part.id for part in datasets}
@@ -43,6 +43,14 @@ def dataset_ranking(db, reference):
     for run in runs:
         if run.snapshot.get("retry_of"):
             continue  # A retry contains only failed items, not the full question bank.
+        settings = run.snapshot.get('settings', {})
+        ref_settings = reference.snapshot.get('settings', {})
+        if settings.get('bfcl_runtime') != ref_settings.get('bfcl_runtime'):
+            continue
+        if settings.get('coding_runtime') != ref_settings.get('coding_runtime'):
+            continue
+        if ref_settings.get('coding_runtime') and settings.get('code_timeout', 10) != ref_settings.get('code_timeout', 10):
+            continue
         groups.setdefault(run.batch_id or run.id, []).append(run)
 
     latest_by_model = {}
@@ -87,22 +95,30 @@ def dataset_ranking(db, reference):
             "cancelled": 0,
             "graded": 0,
             "passed": 0,
+            "categories": {},
             "provisional": any(part.status in ACTIVE for part in parts),
             "cancelled_run": any(part.status == "cancelled" for part in parts),
             "expected_total": question_count * parts[0].snapshot.get("settings", {}).get("repeats", 1),
         }
 
-    for run_id, model_id, status, passed in db.execute(
+    snapshots = {run.id: run.snapshot for _, parts, _ in latest_by_model.values() for run in parts}
+    for run_id, model_id, status, passed, case_index in db.execute(
         select(
             Item.run_id,
             Item.model_id,
             Item.status,
             Item.result["evaluation"]["passed"].as_boolean(),
+            Item.case_index,
         ).where(Item.run_id.in_(selected_run_ids))
     ):
         if run_id not in run_ids_by_model.get(model_id, ()):
             continue
         score = scores[model_id]
+        spec = snapshots[run_id]['cases'][case_index].get('rule', {}).get('bfcl')
+        if spec and status == 'completed' and isinstance(passed, bool):
+            category = score['categories'].setdefault(spec['category'], {'graded': 0, 'passed': 0})
+            category['graded'] += 1
+            category['passed'] += int(passed)
         score["total"] += 1
         if status == "completed":
             score["completed"] += 1
@@ -128,6 +144,12 @@ def dataset_ranking(db, reference):
             and score["total"] == expected_total
             and score["completed"] + score["failed"] + score["cancelled"] == score["total"]
         )
+        if reference.snapshot.get('settings', {}).get('coding_runtime'):
+            score['metric'] = 'pass@1' if score['ranked'] and score['graded'] == expected_total and expected_total == question_count else '已評分通過率'
+            score['ranked'] = score['ranked'] and score['graded'] == expected_total
+        if reference.snapshot.get('settings', {}).get('bfcl_runtime'):
+            score['metric'] = '工具調用正確率'
+            score['ranked'] = score['ranked'] and score['graded'] == expected_total and expected_total == question_count
         ranked.append(score)
     ranked.sort(key=lambda score: (
         not score["ranked"],

@@ -3,11 +3,16 @@ import { ArrowLeft, ArrowRight, Database, FileUp } from "lucide-react";
 import type { Case } from "../../api";
 import { parseDatasetFile } from "./parseDatasetFile";
 import TmmluImport from "./TmmluImport";
+import CodingImport from "./CodingImport";
+import BfclImport from "./BfclImport";
 
 type Source = "huggingface" | "file";
-type Benchmark = "tmmluplus";
+type Benchmark = "tmmluplus" | "humaneval" | "humanevalplus" | "bfcl";
 
 const benchmarks: Record<Benchmark, { name: string; description: string; source: string }> = {
+  bfcl: { name: "BFCL V3", description: "Python 單輪工具調用 · 工具選擇與參數正確性", source: "Gorilla / Berkeley-Function-Calling-Leaderboard" },
+  humaneval: { name: "HumanEval", description: "164 題 Python 函式實作 · 隔離執行測試評分", source: "OpenAI / openai_humaneval" },
+  humanevalplus: { name: "HumanEval+", description: "同一批 Python 題目 · 擴充測試檢查邊界案例", source: "EvalPlus / humanevalplus" },
   tmmluplus: {
     name: "TMMLU+",
     description: "繁體中文知識與推理選擇題 · 預設自動抓取最新版本",
@@ -90,6 +95,18 @@ export default function DatasetImport({
         </>
       )}
 
+      {source === "huggingface" && (benchmark === "humaneval" || benchmark === "humanevalplus") && (
+        <>
+          <button type="button" className="import-back" onClick={() => setBenchmark(null)}><ArrowLeft size={15} /> 返回題庫選擇</button>
+          <h3 className="import-heading">{benchmarks[benchmark].name} · 設定匯入內容</h3>
+          <CodingImport key={benchmark} benchmark={benchmark} onSaved={onSaved} />
+        </>
+      )}
+      {source === "huggingface" && benchmark === "bfcl" && <>
+        <button type="button" className="import-back" onClick={() => setBenchmark(null)}><ArrowLeft size={15} /> 返回題庫選擇</button>
+        <h3 className="import-heading">BFCL V3 · 設定匯入內容</h3>
+        <BfclImport onSaved={onSaved} />
+      </>}
       {source === "file" && (
         <>
           <button type="button" className="import-back" onClick={() => { setSource(null); setError(""); }}><ArrowLeft size={15} /> 返回來源</button>

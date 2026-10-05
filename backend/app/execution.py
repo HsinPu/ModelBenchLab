@@ -96,9 +96,13 @@ def execute_item(item_id):
         # The provider polls this while an HTTP request is pending and closes
         # its local connection on force-cancel. It is never part of the Run snapshot.
         settings["_force_cancelled"] = force_cancelled
-        attempts = []
-        result = None
-        for attempt in range(3):
+        if case['rule']['kind'] == 'tool_call':
+            settings['_bfcl'] = case['rule']['bfcl']
+        # Saved generation is durable before sandbox evaluation. Recovery/reevaluation
+        # must never call the paid provider again.
+        result = item.result if (item.result or {}).get('evaluation', {}).get('pending') else None
+        attempts = list(item.attempts) if result is not None else []
+        for attempt in range(0 if result is not None else 3):
             credential_version = None
             db.refresh(run)
             if run.status in ("cancelling", "cancelled"):
@@ -170,8 +174,24 @@ def execute_item(item_id):
         if item.status != "running":
             return
         if result is not None:
+            result = {**result, 'evaluation': {
+                'kind': case['rule']['kind'], 'passed': None, 'pending': True,
+                'reason': '回答已保存，正在評分',
+            }}
+            saved = db.execute(update(Item).where(Item.id == item_id, Item.status == 'running').values(
+                result=result, attempts=attempts,
+            ))
+            db.commit()
+            if not saved.rowcount:
+                return
             try:
-                result["evaluation"] = evaluate(result["output"], case["rule"])
+                if case['rule']['kind'] == 'tool_call':
+                    from .bfcl import evaluate_tools
+                    result['evaluation'] = evaluate_tools(result, case['rule']['bfcl'], snapshot['settings'])
+                elif case['rule']['kind'] == 'code':
+                    result['evaluation'] = evaluate(result['output'], case['rule'], snapshot['settings'], force_cancelled)
+                else:
+                    result["evaluation"] = evaluate(result["output"], case["rule"])
             except Exception:
                 result["evaluation"] = {
                     "passed": None,
@@ -206,6 +226,16 @@ def recover_stale():
         ).all()
         ids = set()
         for item in stale:
+            if (item.result or {}).get('evaluation', {}).get('pending'):
+                # The response/cost is known: finish with an evaluation error and
+                # allow explicit no-charge reevaluation, rather than replay generation.
+                db.execute(update(Item).where(Item.id == item.id, Item.status == 'running').values(
+                    status='completed', finished_at=now(), result={**item.result, 'evaluation': {
+                        'passed': None, 'error': True, 'reason': '評分 Worker 中斷，可重新評分而不重新生成',
+                    }},
+                ))
+                ids.add(item.run_id)
+                continue
             recovered = db.execute(
                 update(Item)
                 .where(Item.id == item.id, Item.status == "running")
